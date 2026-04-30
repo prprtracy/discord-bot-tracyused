@@ -1,6 +1,13 @@
+.env
+*.db
+*.sqlite
+data/
+logs/
+backups/
+exports/
 __pycache__/
 *.pyc
-*.log
-.env
-ledger.db
+node_modules/
 config.py
+*.log
+restart.py
