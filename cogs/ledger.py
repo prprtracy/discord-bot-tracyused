@@ -101,6 +101,17 @@ def _build_xlsx(rows: list[list[str | int | float]]) -> bytes:
     return output.getvalue()
 
 
+def _binding_dcid(binding, fallback: str) -> str:
+    if not binding:
+        return fallback
+
+    if binding.dcid:
+        return binding.dcid
+    if binding.discord_user_name:
+        return binding.discord_user_name
+    return fallback
+
+
 def admin_only():
     return app_commands.checks.has_permissions(administrator=True)
 
@@ -355,7 +366,7 @@ class Ledger(commands.Cog):
         rows: list[list[str | float]] = [["dcid", "nickname", "礼物", "剩余陪玩时长", "待结算时长"]]
         for c in companions:
             binding = self.db.get_binding(interaction.guild_id, c.nickname)
-            dcid = binding.dcid if binding and binding.dcid else c.nickname
+            dcid = _binding_dcid(binding, c.nickname)
             rows.append([
                 dcid,
                 c.nickname,
