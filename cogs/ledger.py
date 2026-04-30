@@ -1,8 +1,9 @@
-import csv
 import io
 import os
 import traceback
+import zipfile
 from datetime import datetime
+from xml.sax.saxutils import escape
 
 import discord
 from discord import app_commands
@@ -18,6 +19,86 @@ def _fmt(hours: float) -> str:
 
 def _operator(interaction: discord.Interaction) -> tuple[str, str]:
     return str(interaction.user.id), interaction.user.display_name
+
+
+def _excel_column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _xlsx_cell(row: int, col: int, value: str | int | float, style: int | None = None) -> str:
+    ref = f"{_excel_column_name(col)}{row}"
+    style_attr = f' s="{style}"' if style is not None else ""
+    if isinstance(value, (int, float)):
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    return f'<c r="{ref}" t="inlineStr"{style_attr}><is><t>{escape(str(value))}</t></is></c>'
+
+
+def _build_xlsx(rows: list[list[str | int | float]]) -> bytes:
+    sheet_rows = []
+    for row_idx, row in enumerate(rows, start=1):
+        cells = "".join(
+            _xlsx_cell(row_idx, col_idx, value, style=1 if row_idx == 1 else None)
+            for col_idx, value in enumerate(row, start=1)
+        )
+        sheet_rows.append(f'<row r="{row_idx}">{cells}</row>')
+
+    last_row = max(len(rows), 1)
+    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+  <cols>
+    <col min="1" max="1" width="18" customWidth="1"/>
+    <col min="2" max="2" width="22" customWidth="1"/>
+    <col min="3" max="3" width="20" customWidth="1"/>
+    <col min="4" max="5" width="16" customWidth="1"/>
+  </cols>
+  <sheetData>{''.join(sheet_rows)}</sheetData>
+  <autoFilter ref="A1:E{last_row}"/>
+</worksheet>'''
+
+    workbook_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="导出" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    workbook_rels_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    rels_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    content_types_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>
+</styleSheet>'''
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as xlsx:
+        xlsx.writestr("[Content_Types].xml", content_types_xml)
+        xlsx.writestr("_rels/.rels", rels_xml)
+        xlsx.writestr("xl/workbook.xml", workbook_xml)
+        xlsx.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        xlsx.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        xlsx.writestr("xl/styles.xml", styles_xml)
+    return output.getvalue()
 
 
 def admin_only():
@@ -264,26 +345,27 @@ class Ledger(commands.Cog):
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     # ── /导出（仅管理员或 BOT_OWNER_ID） ───────────────────────
-    @app_commands.command(name="导出", description="导出陪玩数据 CSV（仅管理员或 BOT_OWNER_ID）")
+    @app_commands.command(name="导出", description="导出陪玩数据 Excel（仅管理员或 BOT_OWNER_ID）")
     @admin_or_owner_only()
-    async def export_csv(self, interaction: discord.Interaction):
+    async def export_excel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         companions = self.db.get_all(interaction.guild_id)
 
-        output = io.StringIO(newline="")
-        writer = csv.writer(output)
-        writer.writerow(["dcid", "礼物", "剩余陪玩时长", "待结算时长"])
+        rows: list[list[str | float]] = [["dcid", "nickname", "礼物", "剩余陪玩时长", "待结算时长"]]
         for c in companions:
-            writer.writerow([
-                c.discord_user_id or "",
+            binding = self.db.get_binding(interaction.guild_id, c.nickname)
+            dcid = binding.dcid if binding and binding.dcid else c.nickname
+            rows.append([
+                dcid,
+                c.nickname,
                 c.gift_name,
-                f"{c.remaining_hours:g}",
-                f"{c.pending_settlement:g}",
+                c.remaining_hours,
+                c.pending_settlement,
             ])
 
-        filename = f"export-{datetime.now().strftime('%Y-%m-%d-%H-%M')}.csv"
-        data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+        filename = f"export-{datetime.now().strftime('%Y-%m-%d-%H-%M')}.xlsx"
+        data = io.BytesIO(_build_xlsx(rows))
         file = discord.File(data, filename=filename)
 
         await interaction.followup.send("✅ 导出完成", file=file, ephemeral=True)

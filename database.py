@@ -11,6 +11,7 @@ class Binding:
     discord_user_id: str
     discord_user_name: str
     created_at: str
+    dcid: Optional[str] = None
 
 DB_PATH = "ledger.db"
 
@@ -127,12 +128,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS bindings (
                     guild_id          INTEGER NOT NULL,
                     nickname          TEXT NOT NULL,
+                    dcid              TEXT,
                     discord_user_id   TEXT NOT NULL,
                     discord_user_name TEXT NOT NULL DEFAULT '',
                     created_at        TEXT NOT NULL,
                     PRIMARY KEY (guild_id, nickname)
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE bindings ADD COLUMN dcid TEXT")
+            except Exception:
+                pass
 
     def _migrate(self, conn: sqlite3.Connection):
         """
@@ -347,8 +353,10 @@ class Database:
     def get_binding(self, guild_id: int, nickname: str) -> Optional["Binding"]:
         """查询某个昵称在当前服务器的绑定关系"""
         with self._conn() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(bindings)").fetchall()}
+            dcid_expr = "dcid" if "dcid" in cols else "NULL"
             row = conn.execute(
-                "SELECT guild_id, nickname, discord_user_id, discord_user_name, created_at "
+                f"SELECT guild_id, nickname, discord_user_id, discord_user_name, created_at, {dcid_expr} "
                 "FROM bindings WHERE guild_id = ? AND nickname = ?",
                 (guild_id, nickname),
             ).fetchone()
