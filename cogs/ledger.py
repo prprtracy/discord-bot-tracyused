@@ -1,4 +1,8 @@
+import csv
+import io
+import os
 import traceback
+from datetime import datetime
 
 import discord
 from discord import app_commands
@@ -20,6 +24,30 @@ def admin_only():
     return app_commands.checks.has_permissions(administrator=True)
 
 
+def _bot_owner_id() -> str:
+    owner_id = os.getenv("BOT_OWNER_ID", "").strip()
+    if owner_id:
+        return owner_id
+
+    try:
+        import config
+    except Exception:
+        return ""
+    return str(getattr(config, "BOT_OWNER_ID", "")).strip()
+
+
+def admin_or_owner_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        owner_id = _bot_owner_id()
+        if owner_id and str(interaction.user.id) == owner_id:
+            return True
+
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        return bool(permissions and permissions.administrator)
+
+    return app_commands.check(predicate)
+
+
 class Ledger(commands.Cog):
     def __init__(self, bot: commands.Bot, db: Database):
         self.bot = bot
@@ -30,7 +58,7 @@ class Ledger(commands.Cog):
     ):
         print(f"[ERROR] {type(error).__name__}: {error}")
         traceback.print_exc()
-        msg = "你没有权限使用此命令" if isinstance(error, app_commands.MissingPermissions) \
+        msg = "你没有权限使用此命令" if isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)) \
               else f"❌ 命令出错：{error}"
         try:
             if not interaction.response.is_done():
@@ -234,6 +262,31 @@ class Ledger(commands.Cog):
                 f"　待结算：{_fmt(c.pending_settlement)}\n"
             )
         await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    # ── /导出（仅管理员或 BOT_OWNER_ID） ───────────────────────
+    @app_commands.command(name="导出", description="导出陪玩数据 CSV（仅管理员或 BOT_OWNER_ID）")
+    @admin_or_owner_only()
+    async def export_csv(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        companions = self.db.get_all(interaction.guild_id)
+
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(["dcid", "礼物", "剩余陪玩时长", "待结算时长"])
+        for c in companions:
+            writer.writerow([
+                c.discord_user_id or "",
+                c.gift_name,
+                f"{c.remaining_hours:g}",
+                f"{c.pending_settlement:g}",
+            ])
+
+        filename = f"export-{datetime.now().strftime('%Y-%m-%d-%H-%M')}.csv"
+        data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+        file = discord.File(data, filename=filename)
+
+        await interaction.followup.send("✅ 导出完成", file=file, ephemeral=True)
 
     # ── /历史记录（仅管理员） ─────────────────────────────────
     @app_commands.command(name="历史记录", description="查询某个陪陪的完整操作流水（仅管理员）")
