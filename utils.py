@@ -1,7 +1,66 @@
 import asyncio
+import os
 import discord
+from discord import app_commands
 
 from database import Database
+
+
+NO_STAFF_ROLE_MSG = "本服务器还没有设置管理身份组，请联系机器人拥有者使用 /设置管理身份组 进行设置"
+NO_PERMISSION_MSG = "你没有权限使用此命令"
+OWNER_ONLY_MSG = "只有机器人拥有者可以设置管理身份组"
+
+
+def bot_owner_id() -> str:
+    owner_id = os.getenv("BOT_OWNER_ID", "").strip()
+    if owner_id:
+        return owner_id
+
+    try:
+        import config
+    except Exception:
+        return ""
+    return str(getattr(config, "BOT_OWNER_ID", "")).strip()
+
+
+def is_bot_owner(interaction: discord.Interaction) -> bool:
+    owner_id = bot_owner_id()
+    return bool(owner_id and str(interaction.user.id) == owner_id)
+
+
+class StaffRoleCheckFailure(app_commands.CheckFailure):
+    pass
+
+
+async def staff_role_predicate(interaction: discord.Interaction) -> bool:
+    if is_bot_owner(interaction):
+        return True
+
+    if interaction.guild_id is None:
+        raise StaffRoleCheckFailure(NO_PERMISSION_MSG)
+
+    settings = Database().get_guild_settings(interaction.guild_id)
+    staff_role_id = settings.staff_role_id if settings else None
+    if not staff_role_id:
+        raise StaffRoleCheckFailure(NO_STAFF_ROLE_MSG)
+
+    roles = getattr(interaction.user, "roles", [])
+    if any(str(role.id) == str(staff_role_id) for role in roles):
+        return True
+
+    raise StaffRoleCheckFailure(NO_PERMISSION_MSG)
+
+
+def staff_role_check():
+    return app_commands.check(staff_role_predicate)
+
+
+def check_failure_message(error: app_commands.AppCommandError) -> str | None:
+    if isinstance(error, StaffRoleCheckFailure):
+        return str(error) or NO_PERMISSION_MSG
+    if isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)):
+        return NO_PERMISSION_MSG
+    return None
 
 
 def _is_valid_url(url: str | None) -> bool:

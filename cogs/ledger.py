@@ -1,5 +1,4 @@
 import io
-import os
 import traceback
 import zipfile
 from datetime import datetime
@@ -10,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import Database
-from utils import fire_log
+from utils import check_failure_message, fire_log, staff_role_check
 
 
 def _fmt(hours: float) -> str:
@@ -113,31 +112,11 @@ def _binding_dcid(binding, fallback: str) -> str:
 
 
 def admin_only():
-    return app_commands.checks.has_permissions(administrator=True)
-
-
-def _bot_owner_id() -> str:
-    owner_id = os.getenv("BOT_OWNER_ID", "").strip()
-    if owner_id:
-        return owner_id
-
-    try:
-        import config
-    except Exception:
-        return ""
-    return str(getattr(config, "BOT_OWNER_ID", "")).strip()
+    return staff_role_check()
 
 
 def admin_or_owner_only():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        owner_id = _bot_owner_id()
-        if owner_id and str(interaction.user.id) == owner_id:
-            return True
-
-        permissions = getattr(interaction.user, "guild_permissions", None)
-        return bool(permissions and permissions.administrator)
-
-    return app_commands.check(predicate)
+    return staff_role_check()
 
 
 class Ledger(commands.Cog):
@@ -150,8 +129,7 @@ class Ledger(commands.Cog):
     ):
         print(f"[ERROR] {type(error).__name__}: {error}")
         traceback.print_exc()
-        msg = "你没有权限使用此命令" if isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)) \
-              else f"❌ 命令出错：{error}"
+        msg = check_failure_message(error) or f"❌ 命令出错：{error}"
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message(msg, ephemeral=True)
@@ -165,7 +143,7 @@ class Ledger(commands.Cog):
         fire_log(self.bot, interaction.guild_id, self.db, content)
 
     # ── /添加陪玩 ──────────────────────────────────────────────
-    @app_commands.command(name="添加陪玩", description="添加或增加陪玩时长（仅管理员）")
+    @app_commands.command(name="添加陪玩", description="添加或增加陪玩时长（仅管理身份组）")
     @app_commands.describe(昵称="陪陪的昵称", 礼物="礼物名称", 类型="娱乐 或 技术", 时长="添加的小时数")
     @app_commands.choices(类型=[
         app_commands.Choice(name="娱乐", value="娱乐"),
@@ -280,8 +258,8 @@ class Ledger(commands.Cog):
             f"剩余陪玩：{_fmt(c.remaining_hours)} ｜ 待结算：{_fmt(c.pending_settlement)}"
         )
 
-    # ── /结算（仅管理员） ──────────────────────────────────────
-    @app_commands.command(name="结算", description="结算陪玩时长（仅管理员）")
+    # ── /结算（仅管理身份组） ──────────────────────────────────────
+    @app_commands.command(name="结算", description="结算陪玩时长（仅管理身份组）")
     @app_commands.describe(昵称="陪陪的昵称", 时长="结算的小时数")
     @admin_only()
     async def settle(self, interaction: discord.Interaction, 昵称: str, 时长: float):
@@ -317,8 +295,8 @@ class Ledger(commands.Cog):
 
         self._log(interaction, f"💰 **{昵称}** 结算 {_fmt(时长)} 啦")
 
-    # ── /查询（仅管理员） ──────────────────────────────────────
-    @app_commands.command(name="查询", description="查询所有陪陪的剩余陪玩时长（仅管理员）")
+    # ── /查询（仅管理身份组） ──────────────────────────────────────
+    @app_commands.command(name="查询", description="查询所有陪陪的剩余陪玩时长（仅管理身份组）")
     @admin_only()
     async def query(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -336,8 +314,8 @@ class Ledger(commands.Cog):
             )
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    # ── /查询结算（仅管理员） ──────────────────────────────────
-    @app_commands.command(name="查询结算", description="查询所有陪陪的待结算时长（仅管理员）")
+    # ── /查询结算（仅管理身份组） ──────────────────────────────────
+    @app_commands.command(name="查询结算", description="查询所有陪陪的待结算时长（仅管理身份组）")
     @admin_only()
     async def query_settlement(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -355,8 +333,8 @@ class Ledger(commands.Cog):
             )
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    # ── /导出（仅管理员或 BOT_OWNER_ID） ───────────────────────
-    @app_commands.command(name="导出", description="导出陪玩数据 Excel（仅管理员或 BOT_OWNER_ID）")
+    # ── /导出（仅管理身份组或 BOT_OWNER_ID） ───────────────────────
+    @app_commands.command(name="导出", description="导出陪玩数据 Excel（仅管理身份组或 BOT_OWNER_ID）")
     @admin_or_owner_only()
     async def export_excel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -381,8 +359,8 @@ class Ledger(commands.Cog):
 
         await interaction.followup.send("✅ 导出完成", file=file, ephemeral=True)
 
-    # ── /历史记录（仅管理员） ─────────────────────────────────
-    @app_commands.command(name="历史记录", description="查询某个陪陪的完整操作流水（仅管理员）")
+    # ── /历史记录（仅管理身份组） ─────────────────────────────────
+    @app_commands.command(name="历史记录", description="查询某个陪陪的完整操作流水（仅管理身份组）")
     @app_commands.describe(昵称="陪陪的昵称")
     @admin_only()
     async def history(self, interaction: discord.Interaction, 昵称: str):
@@ -404,8 +382,8 @@ class Ledger(commands.Cog):
 
         await interaction.followup.send(text, ephemeral=True)
 
-    # ── /修改记录（仅管理员） ──────────────────────────────────
-    @app_commands.command(name="修改记录", description="手动修改某条陪陪记录的字段（仅管理员）")
+    # ── /修改记录（仅管理身份组） ──────────────────────────────────
+    @app_commands.command(name="修改记录", description="手动修改某条陪陪记录的字段（仅管理身份组）")
     @app_commands.describe(
         昵称="要修改的陪陪昵称",
         礼物="新礼物名称（不改留空）",
@@ -481,7 +459,7 @@ class Ledger(commands.Cog):
         nicknames = self.db.get_nicknames_by_user(gid, uid)
         if not nicknames:
             await interaction.followup.send(
-                "你还没有绑定陪玩昵称，请联系管理员使用 /绑定账号", ephemeral=True
+                "你还没有绑定陪玩昵称，请联系管理身份组使用 /绑定账号", ephemeral=True
             )
             return
 
@@ -504,8 +482,8 @@ class Ledger(commands.Cog):
             )
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    # ── /绑定账号（仅管理员） ──────────────────────────────────
-    @app_commands.command(name="绑定账号", description="将陪陪昵称绑定到指定 Discord 用户（仅管理员）")
+    # ── /绑定账号（仅管理身份组） ──────────────────────────────────
+    @app_commands.command(name="绑定账号", description="将陪陪昵称绑定到指定 Discord 用户（仅管理身份组）")
     @app_commands.describe(昵称="陪陪的昵称（不需要已存在于记录表中）", 用户="要绑定的 Discord 用户")
     @admin_only()
     async def bind_account(self, interaction: discord.Interaction, 昵称: str, 用户: discord.Member):
@@ -530,8 +508,8 @@ class Ledger(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /删除记录（仅管理员） ──────────────────────────────────
-    @app_commands.command(name="删除记录", description="删除一条陪陪记录（仅管理员）")
+    # ── /删除记录（仅管理身份组） ──────────────────────────────────
+    @app_commands.command(name="删除记录", description="删除一条陪陪记录（仅管理身份组）")
     @app_commands.describe(昵称="要删除的陪陪昵称")
     @admin_only()
     async def delete_record(self, interaction: discord.Interaction, 昵称: str):

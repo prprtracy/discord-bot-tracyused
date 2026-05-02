@@ -58,6 +58,7 @@ class GuildSettings:
     log_channel_id: Optional[int]      # 业务日志频道（报单/结算等）
     allowed_channel_id: Optional[int]  # 允许使用 slash commands 的频道
     monitor_channel_id: Optional[int]  # 监听通知频道（语音/成员进出）
+    staff_role_id: Optional[str] = None
     welcome_channel_id: Optional[int] = None  # 欢迎消息频道
     leave_channel_id: Optional[int] = None    # 成员离开通知频道
 
@@ -122,6 +123,10 @@ class Database:
                     conn.execute(f"ALTER TABLE guild_settings ADD COLUMN {col} INTEGER")
                 except Exception:
                     pass
+            try:
+                conn.execute("ALTER TABLE guild_settings ADD COLUMN staff_role_id TEXT")
+            except Exception:
+                pass
 
             # ── bindings 表（独立绑定关系，不依赖 companions 是否存在）──
             conn.execute("""
@@ -403,7 +408,14 @@ class Database:
     def get_guild_settings(self, guild_id: int) -> Optional[GuildSettings]:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM guild_settings WHERE guild_id = ?", (guild_id,)
+                """
+                SELECT guild_id, bot_nickname, webhook_url, display_name, avatar_url,
+                       log_channel_id, allowed_channel_id, monitor_channel_id,
+                       staff_role_id, welcome_channel_id, leave_channel_id
+                FROM guild_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
             ).fetchone()
         return GuildSettings(*row) if row else None
 
@@ -417,6 +429,7 @@ class Database:
         log_channel_id: int | None = None,
         allowed_channel_id: int | None = None,
         monitor_channel_id: int | None = None,
+        staff_role_id: str | None = None,
         welcome_channel_id: int | None = None,
         leave_channel_id: int | None = None,
     ):
@@ -425,8 +438,8 @@ class Database:
                 INSERT INTO guild_settings
                     (guild_id, bot_nickname, webhook_url, display_name, avatar_url,
                      log_channel_id, allowed_channel_id, monitor_channel_id,
-                     welcome_channel_id, leave_channel_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     staff_role_id, welcome_channel_id, leave_channel_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     bot_nickname       = excluded.bot_nickname,
                     webhook_url        = excluded.webhook_url,
@@ -435,8 +448,10 @@ class Database:
                     log_channel_id     = excluded.log_channel_id,
                     allowed_channel_id = excluded.allowed_channel_id,
                     monitor_channel_id = excluded.monitor_channel_id,
+                    staff_role_id      = COALESCE(excluded.staff_role_id, guild_settings.staff_role_id),
                     welcome_channel_id = excluded.welcome_channel_id,
                     leave_channel_id   = excluded.leave_channel_id
             """, (guild_id, bot_nickname, webhook_url, display_name, avatar_url,
                   log_channel_id, allowed_channel_id, monitor_channel_id,
+                  staff_role_id,
                   welcome_channel_id, leave_channel_id))

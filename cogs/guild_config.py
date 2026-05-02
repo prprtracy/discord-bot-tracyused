@@ -3,11 +3,19 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import Database
-from utils import check_url_accessible, _is_expiring_discord_url, _is_valid_url
+from utils import (
+    OWNER_ONLY_MSG,
+    check_failure_message,
+    check_url_accessible,
+    is_bot_owner,
+    staff_role_check,
+    _is_expiring_discord_url,
+    _is_valid_url,
+)
 
 
 def admin_only():
-    return app_commands.checks.has_permissions(administrator=True)
+    return staff_role_check()
 
 
 class GuildConfig(commands.Cog):
@@ -18,19 +26,50 @@ class GuildConfig(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ):
-        if isinstance(error, app_commands.MissingPermissions):
+        msg = check_failure_message(error)
+        if msg:
             if not interaction.response.is_done():
-                await interaction.response.send_message("你没有权限使用此命令", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
             else:
-                await interaction.followup.send("你没有权限使用此命令", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
         else:
             raise error
 
     def _get(self, guild_id: int):
         return self.db.get_guild_settings(guild_id)
 
-    # ── /设置服务器显示（仅管理员） ────────────────────────────
-    @app_commands.command(name="设置服务器显示", description="配置 webhook、显示名称和头像（仅管理员）")
+    @app_commands.command(name="设置管理身份组", description="设置本服务器可使用管理命令的身份组")
+    @app_commands.describe(role="拥有管理权限的 Discord 身份组")
+    async def set_staff_role(self, interaction: discord.Interaction, role: discord.Role):
+        if not is_bot_owner(interaction):
+            await interaction.response.send_message(OWNER_ONLY_MSG, ephemeral=True)
+            return
+
+        gid = interaction.guild_id
+        if gid is None:
+            await interaction.response.send_message("此命令只能在服务器内使用", ephemeral=True)
+            return
+
+        s = self._get(gid)
+        self.db.upsert_guild_settings(
+            gid,
+            bot_nickname       = s.bot_nickname       if s else None,
+            webhook_url        = s.webhook_url        if s else None,
+            display_name       = s.display_name       if s else None,
+            avatar_url         = s.avatar_url         if s else None,
+            log_channel_id     = s.log_channel_id     if s else None,
+            allowed_channel_id = s.allowed_channel_id if s else None,
+            monitor_channel_id = s.monitor_channel_id if s else None,
+            staff_role_id      = str(role.id),
+            welcome_channel_id = s.welcome_channel_id if s else None,
+            leave_channel_id   = s.leave_channel_id   if s else None,
+        )
+        await interaction.response.send_message(
+            f"已将管理身份组设置为 {role.mention}", ephemeral=True
+        )
+
+    # ── /设置服务器显示（仅管理身份组） ────────────────────────────
+    @app_commands.command(name="设置服务器显示", description="配置 webhook、显示名称和头像（仅管理身份组）")
     @app_commands.describe(
         bot昵称="bot 在本服务器显示的昵称（可选）",
         webhook_url="用于发送公开日志消息的 Webhook URL",
@@ -136,8 +175,8 @@ class GuildConfig(commands.Cog):
             f"✅ 服务器显示配置已更新{note_str}", ephemeral=True
         )
 
-    # ── /查看服务器显示（仅管理员） ────────────────────────────
-    @app_commands.command(name="查看服务器显示", description="查看本服务器当前的显示配置（仅管理员）")
+    # ── /查看服务器显示（仅管理身份组） ────────────────────────────
+    @app_commands.command(name="查看服务器显示", description="查看本服务器当前的显示配置（仅管理身份组）")
     @admin_only()
     async def view_guild_display(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -171,16 +210,15 @@ class GuildConfig(commands.Cog):
         ]
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    # ── /设置日志频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="设置日志频道", description="将当前频道设为业务日志频道（仅管理员）")
+    # ── /设置日志频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="设置日志频道", description="将当前频道设为业务日志频道（仅管理身份组）")
     @admin_only()
     async def set_log_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         gid = interaction.guild_id
         cid = interaction.channel_id
-        is_admin = interaction.user.guild_permissions.administrator
-        print(f"[设置日志频道] guild_id={gid} channel_id={cid} user={interaction.user}({interaction.user.id}) is_admin={is_admin}")
+        print(f"[设置日志频道] guild_id={gid} channel_id={cid} user={interaction.user}({interaction.user.id})")
 
         channel = interaction.channel
         if channel is None:
@@ -230,8 +268,8 @@ class GuildConfig(commands.Cog):
             f"✅ 业务日志频道已设置为 {interaction.channel.mention}", ephemeral=True
         )
 
-    # ── /查看日志频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="查看日志频道", description="查看当前业务日志频道（仅管理员）")
+    # ── /查看日志频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="查看日志频道", description="查看当前业务日志频道（仅管理身份组）")
     @admin_only()
     async def view_log_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -239,8 +277,8 @@ class GuildConfig(commands.Cog):
         ch = f"<#{s.log_channel_id}>" if s and s.log_channel_id else "（未设置）"
         await interaction.followup.send(f"📋 业务日志频道：{ch}", ephemeral=True)
 
-    # ── /设置监听频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="设置监听频道", description="将当前频道设为监听通知频道（仅管理员）")
+    # ── /设置监听频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="设置监听频道", description="将当前频道设为监听通知频道（仅管理身份组）")
     @admin_only()
     async def set_monitor_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -261,8 +299,8 @@ class GuildConfig(commands.Cog):
             f"✅ 已将当前频道设置为监听通知频道：{interaction.channel.mention}", ephemeral=True
         )
 
-    # ── /查看监听频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="查看监听频道", description="查看当前监听通知频道（仅管理员）")
+    # ── /查看监听频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="查看监听频道", description="查看当前监听通知频道（仅管理身份组）")
     @admin_only()
     async def view_monitor_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -270,8 +308,8 @@ class GuildConfig(commands.Cog):
         ch = f"<#{s.monitor_channel_id}>" if s and s.monitor_channel_id else "（未设置）"
         await interaction.followup.send(f"👁️ 监听通知频道：{ch}", ephemeral=True)
 
-    # ── /设置欢迎频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="设置欢迎频道", description="将当前频道设为新成员欢迎消息频道（仅管理员）")
+    # ── /设置欢迎频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="设置欢迎频道", description="将当前频道设为新成员欢迎消息频道（仅管理身份组）")
     @admin_only()
     async def set_welcome_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -292,8 +330,8 @@ class GuildConfig(commands.Cog):
             f"✅ 已将当前频道设置为欢迎频道：{interaction.channel.mention}", ephemeral=True
         )
 
-    # ── /设置离开频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="设置离开频道", description="将当前频道设为成员离开通知频道（仅管理员）")
+    # ── /设置离开频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="设置离开频道", description="将当前频道设为成员离开通知频道（仅管理身份组）")
     @admin_only()
     async def set_leave_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -314,8 +352,8 @@ class GuildConfig(commands.Cog):
             f"✅ 已将当前频道设置为离开通知频道：{interaction.channel.mention}", ephemeral=True
         )
 
-    # ── /查看离开频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="查看离开频道", description="查看当前成员离开通知频道（仅管理员）")
+    # ── /查看离开频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="查看离开频道", description="查看当前成员离开通知频道（仅管理身份组）")
     @admin_only()
     async def view_leave_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -329,8 +367,8 @@ class GuildConfig(commands.Cog):
                 "当前服务器尚未设置离开通知频道", ephemeral=True
             )
 
-    # ── /查看欢迎频道（仅管理员） ──────────────────────────────
-    @app_commands.command(name="查看欢迎频道", description="查看当前新成员欢迎消息频道（仅管理员）")
+    # ── /查看欢迎频道（仅管理身份组） ──────────────────────────────
+    @app_commands.command(name="查看欢迎频道", description="查看当前新成员欢迎消息频道（仅管理身份组）")
     @admin_only()
     async def view_welcome_channel(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
