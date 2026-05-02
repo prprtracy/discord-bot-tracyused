@@ -4,7 +4,6 @@ from discord.ext import commands
 
 from database import Database
 from utils import (
-    OWNER_ONLY_MSG,
     check_failure_message,
     check_url_accessible,
     is_bot_owner,
@@ -41,8 +40,13 @@ class GuildConfig(commands.Cog):
     @app_commands.command(name="设置管理身份组", description="设置本服务器可使用管理命令的身份组")
     @app_commands.describe(role="拥有管理权限的 Discord 身份组")
     async def set_staff_role(self, interaction: discord.Interaction, role: discord.Role):
-        if not is_bot_owner(interaction):
-            await interaction.response.send_message(OWNER_ONLY_MSG, ephemeral=True)
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        is_server_admin = bool(permissions and permissions.administrator)
+        if not (is_bot_owner(interaction) or is_server_admin):
+            await interaction.response.send_message(
+                "只有机器人拥有者或服务器管理员可以设置管理身份组",
+                ephemeral=True,
+            )
             return
 
         gid = interaction.guild_id
