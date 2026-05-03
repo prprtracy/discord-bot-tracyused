@@ -149,7 +149,6 @@ class Ledger(commands.Cog):
         app_commands.Choice(name="娱乐", value="娱乐"),
         app_commands.Choice(name="技术", value="技术"),
     ])
-    @admin_only()
     async def add_companion(
         self,
         interaction: discord.Interaction,
