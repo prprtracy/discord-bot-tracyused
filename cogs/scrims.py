@@ -13,28 +13,31 @@ from database import Database, Scrim
 
 PLAYER_COUNT = 10
 TEAM_SIZE = PLAYER_COUNT // 2
-# Riot's standard map catalog: https://playvalorant.com/zh-tw/maps/
+# Riot's map catalog: https://playvalorant.com/en-us/maps/
+# Summit uses the official 13.00 patch artwork shown in the announcement preview.
 VALORANT_MAPS = {
-    "Abyss": "深窟幽境",
-    "Ascent": "義境空島",
-    "Bind": "劫境之地",
-    "Breeze": "熱帶樂園",
-    "Corrode": "晶蝕之地",
-    "Fracture": "天漠之峽",
-    "Haven": "遺落境地",
-    "Icebox": "極地寒港",
-    "Lotus": "蓮華古城",
-    "Pearl": "深海遺珠",
-    "Split": "雙塔迷城",
-    "Summit": "頂峰亭閣",
-    "Sunset": "日落之城",
+    "Abyss": ("深窟幽境", "news_live/53698d442a14b5a6be643d53eb970ac16442cb38-930x522.png"),
+    "Ascent": ("義境空島", "news/5cb7e65c04a489eccd725ce693fdc11e99982e10-3840x2160.png"),
+    "Bind": ("劫境之地", "news/7df1e6ee284810ef0cbf8db369c214a8cbf6578c-3840x2160.png"),
+    "Breeze": ("熱帶樂園", "news_live/430fb50965f1d99cdaef3588df13d98dbea340cf-930x522.png"),
+    "Corrode": ("晶蝕之地", "news_live/6e3e66577519c8290d874aa94d82e28aec2ccc3e-915x515.jpg"),
+    "Fracture": ("天漠之峽", "news/983a6d66978aabd3ccd4e51517298d9a0b5467d9-3840x2160.png"),
+    "Haven": ("遺落境地", "news/bccc7b5f8647a4f654d4bb359247bce6e82c77ab-3840x2160.png"),
+    "Icebox": ("極地寒港", "news/72853f583a0f6b25aed54870531756483a7b61de-3840x2160.png"),
+    "Lotus": ("蓮華古城", "news/67d199e0f7108bc60e8293d3f9a37538b0b55b11-3840x2160.png"),
+    "Pearl": ("深海遺珠", "news/7ba5df090f5efee7988d8d33f4b43c3441cb1aab-3840x2160.png"),
+    "Split": ("雙塔迷城", "news/878d51688c0f9dd0de827162e80c40811668e0c6-3840x2160.png"),
+    "Summit": ("頂峰亭閣", "news_live/ff7f89ff681da27cfec24bf61986c23fb2aba543-1920x1080.jpg"),
+    "Sunset": ("日落之城", "news/5101e4ee241fbfca261bf8150230236c46c8b991-3840x2160.png"),
 }
+RIOT_MAP_IMAGE_BASE = "https://cmsassets.rgpub.io/sanity/images/dsfx7636/"
 NO_PINGS = discord.AllowedMentions.none()
 log = logging.getLogger(__name__)
 
 
 def map_label(name: str) -> str:
-    return f"{name}（{VALORANT_MAPS[name]}）"
+    localized_name, _ = VALORANT_MAPS[name]
+    return f"{name}（{localized_name}）"
 
 
 def teams_text(scrim: Scrim) -> str:
@@ -497,6 +500,44 @@ class Scrims(commands.Cog):
             return False
         return True
 
+    async def publish_map_announcement(
+        self, scrim: Scrim, map_name: str, results: dict[int, str],
+    ) -> int:
+        _, image_path = VALORANT_MAPS[map_name]
+        map_card = discord.Embed(
+            title=f"第 {scrim.number} 次趣味瓦内战 · 地图已确认",
+            description=f"**{map_label(map_name)}**",
+        )
+        map_card.set_image(url=f"{RIOT_MAP_IMAGE_BASE}{image_path}?w=1280&fit=max&fm=jpg")
+
+        guild = self.bot.get_guild(scrim.guild_id)
+        team_rows: dict[str, list[str]] = {"A": [], "B": []}
+        for user_id, saved_name in scrim.players.items():
+            member = guild.get_member(user_id) if guild else None
+            nickname = member.display_name if member else saved_name
+            nickname = discord.utils.escape_mentions(discord.utils.escape_markdown(nickname))
+            if user_id == scrim.host_id:
+                nickname += "（主办人）"
+            passive = discord.utils.escape_mentions(results[user_id])
+            team = "A" if user_id in scrim.team_a else "B"
+            team_rows[team].append(f"**{nickname}** · {passive}")
+        embeds = [map_card] + [
+            discord.Embed(title=f"{team} 队", description="\n".join(rows))
+            for team, rows in team_rows.items()
+        ]
+
+        channel = self.bot.get_partial_messageable(scrim.channel_id)
+        if scrim.map_announcement_id is not None:
+            message = channel.get_partial_message(scrim.map_announcement_id)
+            try:
+                await message.edit(embeds=embeds, allowed_mentions=NO_PINGS)
+            except discord.NotFound:
+                pass  # Recreate the announcement if it was deleted.
+            else:
+                return scrim.map_announcement_id
+        message = await channel.send(embeds=embeds, allowed_mentions=NO_PINGS)
+        return message.id
+
     def get_confirmed_scrim(self, interaction: discord.Interaction, round_id: int) -> Scrim | None:
         if interaction.guild_id is None:
             return None
@@ -579,12 +620,25 @@ class Scrims(commands.Cog):
                 if selected not in VALORANT_MAPS:
                     await interaction.edit_original_response(content="请选择地图列表中的选项。")
                     return
-                updated = replace(scrim, map_name=selected)
+                results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
+                if not passives_complete(scrim, results):
+                    await interaction.edit_original_response(content="被动结果不完整，暂时无法发布地图公告。")
+                    return
+                try:
+                    announcement_id = await self.publish_map_announcement(scrim, selected, results)
+                except discord.HTTPException:
+                    log.exception("Could not publish map announcement for scrim %s", round_id)
+                    await interaction.edit_original_response(content="地图公告发布失败，请检查频道的发送消息和嵌入链接权限后重试。")
+                    return
+                updated = replace(scrim, map_name=selected, map_announcement_id=announcement_id)
                 result = f"本场比赛地图为 **{map_label(selected)}**。"
             self.db.save_scrim(updated)
             if not await self.publish_passive_table(updated):
-                self.db.save_scrim(scrim)
-                result = "公告更新失败，操作暂未保存，请重试。"
+                if action == "confirm":
+                    self.db.save_scrim(scrim)
+                    result = "公告更新失败，操作暂未保存，请重试。"
+                else:
+                    result += "\n地图公告已发布，原报名公告刷新失败。重新选图可以重试刷新。"
         await interaction.edit_original_response(content=result)
 
     @staticmethod

@@ -81,6 +81,7 @@ class Scrim:
     revision: int = 0
     passives_confirmed: bool = False
     map_name: str | None = None
+    map_announcement_id: int | None = None
 
 
 class Database:
@@ -114,6 +115,7 @@ class Database:
                     revision INTEGER NOT NULL,
                     passives_confirmed INTEGER NOT NULL DEFAULT 0,
                     map_name TEXT,
+                    map_announcement_id INTEGER,
                     PRIMARY KEY (guild_id, message_id),
                     UNIQUE (guild_id, number)
                 )
@@ -123,6 +125,8 @@ class Database:
                 conn.execute("ALTER TABLE scrims ADD COLUMN passives_confirmed INTEGER NOT NULL DEFAULT 0")
             if "map_name" not in scrim_columns:
                 conn.execute("ALTER TABLE scrims ADD COLUMN map_name TEXT")
+            if "map_announcement_id" not in scrim_columns:
+                conn.execute("ALTER TABLE scrims ADD COLUMN map_announcement_id INTEGER")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scrim_passive_pools (
                     guild_id INTEGER PRIMARY KEY,
@@ -234,32 +238,34 @@ class Database:
         with closing(self._conn()) as conn:
             row = conn.execute("""
                 SELECT guild_id, number, channel_id, message_id, host_id,
-                       players, stage, team_a, revision, passives_confirmed, map_name
+                       players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id
                 FROM scrims WHERE guild_id = ? AND message_id = ?
             """, (guild_id, message_id)).fetchone()
         if row is None:
             return None
         players = {int(user_id): name for user_id, name in json.loads(row[5]).items()}
-        return Scrim(*row[:5], players, row[6], tuple(json.loads(row[7])), row[8], bool(row[9]), row[10])
+        return Scrim(*row[:5], players, row[6], tuple(json.loads(row[7])), row[8], bool(row[9]), *row[10:])
 
     def save_scrim(self, scrim: Scrim):
         with closing(self._conn()) as conn, conn:
             conn.execute("""
                 INSERT INTO scrims
                     (guild_id, number, channel_id, message_id, host_id,
-                     players, stage, team_a, revision, passives_confirmed, map_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id, message_id) DO UPDATE SET
                     players = excluded.players,
                     stage = excluded.stage,
                     team_a = excluded.team_a,
                     revision = excluded.revision,
                     passives_confirmed = excluded.passives_confirmed,
-                    map_name = excluded.map_name
+                    map_name = excluded.map_name,
+                    map_announcement_id = excluded.map_announcement_id
             """, (
                 scrim.guild_id, scrim.number, scrim.channel_id, scrim.message_id,
                 scrim.host_id, json.dumps(scrim.players), scrim.stage,
                 json.dumps(scrim.team_a), scrim.revision, scrim.passives_confirmed, scrim.map_name,
+                scrim.map_announcement_id,
             ))
 
     def _scrim_passives(self, conn: sqlite3.Connection, guild_id: int) -> list[str]:
