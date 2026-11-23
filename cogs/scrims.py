@@ -1,0 +1,606 @@
+import asyncio
+import logging
+from dataclasses import replace
+from functools import partial
+from random import choice
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from database import Database, Scrim
+
+
+PLAYER_COUNT = 10
+TEAM_SIZE = PLAYER_COUNT // 2
+# Riot's standard map catalog: https://playvalorant.com/zh-tw/maps/
+VALORANT_MAPS = {
+    "Abyss": "深窟幽境",
+    "Ascent": "義境空島",
+    "Bind": "劫境之地",
+    "Breeze": "熱帶樂園",
+    "Corrode": "晶蝕之地",
+    "Fracture": "天漠之峽",
+    "Haven": "遺落境地",
+    "Icebox": "極地寒港",
+    "Lotus": "蓮華古城",
+    "Pearl": "深海遺珠",
+    "Split": "雙塔迷城",
+    "Summit": "頂峰亭閣",
+    "Sunset": "日落之城",
+}
+NO_PINGS = discord.AllowedMentions.none()
+log = logging.getLogger(__name__)
+
+
+def map_label(name: str) -> str:
+    return f"{name}（{VALORANT_MAPS[name]}）"
+
+
+def teams_text(scrim: Scrim) -> str:
+    team_a = ", ".join(f"<@{user_id}>" for user_id in scrim.team_a)
+    team_b = ", ".join(f"<@{user_id}>" for user_id in scrim.players if user_id not in scrim.team_a)
+    return f"**A 队**　{team_a}\n**B 队**　{team_b}"
+
+
+def roster_text(scrim: Scrim) -> str:
+    return "\n".join(
+        f"{index}. <@{user_id}>" + ("（主办人）" if user_id == scrim.host_id else "")
+        for index, user_id in enumerate(scrim.players, start=1)
+    )
+
+
+def passives_complete(scrim: Scrim, results: dict[int, str]) -> bool:
+    return (
+        len(scrim.players) == PLAYER_COUNT
+        and scrim.players.keys() <= results.keys()
+        and len({results[user_id] for user_id in scrim.players}) == PLAYER_COUNT
+    )
+
+
+class ScrimAnnouncement(discord.ui.View):
+    def __init__(self, cog: "Scrims", signup_open: bool = True):
+        super().__init__(timeout=None)
+        self.cog = cog
+        if not signup_open:
+            self.remove_item(self.join)
+
+    @discord.ui.button(label="确认参加", style=discord.ButtonStyle.success, custom_id="scrim:join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_public(interaction, join=True)
+
+    @discord.ui.button(label="主办人面板", custom_id="scrim:manage")
+    async def manage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_public(interaction, join=False)
+
+
+class PassiveDraw(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:passive:(?P<round_id>\d+):(?P<recipient_id>\d+)"):
+    def __init__(self, round_id: int, recipient_id: int = 0):
+        self.round_id = round_id
+        self.recipient_id = recipient_id
+        super().__init__(discord.ui.Button(
+            label="抽取被动",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"scrim:passive:{round_id}:{recipient_id}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["round_id"]), int(match["recipient_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("Scrims")
+        if cog is not None:
+            await cog.handle_draw(interaction, self.round_id, self.recipient_id)
+
+
+def draw_view(round_id: int, recipient_id: int = 0) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(PassiveDraw(round_id, recipient_id))
+    return view
+
+
+class FinalScrimView(discord.ui.View):
+    def __init__(self, cog: "Scrims", scrim: Scrim | None = None, passives_ready: bool = False):
+        super().__init__(timeout=None)
+        self.cog = cog
+        if scrim is None:
+            return
+        self.add_item(PassiveDraw(scrim.message_id))
+        if scrim.passives_confirmed:
+            self.remove_item(self.reroll)
+            self.remove_item(self.confirm_passives)
+        else:
+            self.remove_item(self.random_map)
+            self.remove_item(self.choose_map)
+            if not passives_ready:
+                self.remove_item(self.confirm_passives)
+
+    @discord.ui.button(label="主办人重抽", custom_id="scrim:reroll")
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.open_reroll_panel(interaction)
+
+    @discord.ui.button(label="确认被动", style=discord.ButtonStyle.success, custom_id="scrim:confirm-passives")
+    async def confirm_passives(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_map_setup(interaction, interaction.message.id, "confirm")
+
+    @discord.ui.button(label="抽取地图", style=discord.ButtonStyle.primary, custom_id="scrim:random-map")
+    async def random_map(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_map_setup(interaction, interaction.message.id, "random")
+
+    @discord.ui.button(label="手动选择地图", custom_id="scrim:choose-map")
+    async def choose_map(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_map_setup(interaction, interaction.message.id, "picker")
+
+
+class MapPicker(discord.ui.View):
+    def __init__(self, cog: "Scrims", scrim: Scrim):
+        super().__init__(timeout=900)
+        picker = discord.ui.Select(
+            placeholder="选择 VALORANT 地图",
+            options=[
+                discord.SelectOption(label=map_label(name), value=name, default=name == scrim.map_name)
+                for name in VALORANT_MAPS
+            ],
+        )
+
+        async def select(interaction: discord.Interaction):
+            await cog.handle_map_setup(interaction, scrim.message_id, "select", picker.values[0])
+
+        picker.callback = select
+        self.add_item(picker)
+
+
+class RerollPanel(discord.ui.View):
+    def __init__(self, cog: "Scrims", scrim: Scrim, results: dict[int, str]):
+        super().__init__(timeout=900)
+        picker = discord.ui.Select(
+            placeholder="选择要重抽的玩家",
+            options=[
+                discord.SelectOption(label=f"{index}. {name}"[:100], value=str(user_id))
+                for index, (user_id, name) in enumerate(scrim.players.items(), start=1)
+                if user_id in results
+            ],
+        )
+
+        async def select(interaction: discord.Interaction):
+            await cog.reroll_passive(interaction, scrim.message_id, int(picker.values[0]))
+
+        picker.callback = select
+        self.add_item(picker)
+
+
+class PassivePoolModal(discord.ui.Modal, title="设置内战被动库"):
+    def __init__(self, db: Database, guild_id: int):
+        super().__init__(timeout=600)
+        self.db = db
+        self.entries = discord.ui.TextInput(
+            label="被动条件（每行一条）",
+            style=discord.TextStyle.paragraph,
+            default="\n".join(db.get_scrim_passives(guild_id)),
+            max_length=4000,
+        )
+        self.add_item(self.entries)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild_id is None or not interaction.permissions.manage_guild:
+            await interaction.response.send_message("你需要「管理服务器」权限。", ephemeral=True)
+            return
+        entries = list(dict.fromkeys(line.strip() for line in self.entries.value.splitlines() if line.strip()))
+        if not entries or any(len(entry) > 300 for entry in entries):
+            await interaction.response.send_message("请输入至少一条被动，每条最多 300 字。", ephemeral=True)
+            return
+        self.db.set_scrim_passives(interaction.guild_id, entries)
+        await interaction.response.send_message(f"已保存 {len(entries)} 条被动。", ephemeral=True)
+
+
+class HostPanel(discord.ui.View):
+    def __init__(self, cog: "Scrims", scrim: Scrim, mode: str = ""):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.scrim = scrim
+        if mode == "remove":
+            self.add_picker("删除用户", "remove", 1)
+        elif mode == "pick":
+            self.add_picker("选择 A 队的 5 名成员", "pick", TEAM_SIZE)
+        elif scrim.stage in ("signup", "full"):
+            if len(scrim.players) > 1:
+                self.add_button("删除用户", "show_remove", discord.ButtonStyle.danger)
+            if scrim.stage == "full":
+                self.add_button("确认列表，开始分队", "start", discord.ButtonStyle.success)
+        elif scrim.stage == "teams" and scrim.team_a:
+            self.add_button("确认分队", "confirm", discord.ButtonStyle.success)
+            self.add_button("修改分队", "show_pick", discord.ButtonStyle.secondary)
+        elif scrim.stage == "teams":
+            self.add_picker("选择 A 队的 5 名成员", "pick", TEAM_SIZE)
+
+    def add_button(self, label: str, action: str, style: discord.ButtonStyle):
+        button = discord.ui.Button(label=label, style=style)
+        button.callback = partial(self.cog.handle_host, self.scrim, action)
+        self.add_item(button)
+
+    def add_picker(self, placeholder: str, action: str, count: int):
+        options = [
+            discord.SelectOption(
+                label=f"{index}. {name}"[:100],
+                value=str(user_id),
+                description="主办人" if user_id == self.scrim.host_id else None,
+                default=action == "pick" and user_id in self.scrim.team_a,
+            )
+            for index, (user_id, name) in enumerate(self.scrim.players.items(), start=1)
+            if action != "remove" or user_id != self.scrim.host_id
+        ]
+        picker = discord.ui.Select(
+            placeholder=placeholder, min_values=count, max_values=count, options=options,
+        )
+
+        async def select(interaction: discord.Interaction):
+            await self.cog.handle_host(self.scrim, action, interaction, tuple(map(int, picker.values)))
+
+        picker.callback = select
+        self.add_item(picker)
+        if action == "remove" or self.scrim.team_a:
+            self.add_button("返回", "back", discord.ButtonStyle.secondary)
+
+
+class Scrims(commands.Cog):
+    def __init__(self, bot: commands.Bot, db: Database):
+        self.bot = bot
+        self.db = db
+        self.guild_locks: dict[int, asyncio.Lock] = {}
+
+    async def cog_load(self):
+        # The message ID identifies the round, so one fallback view handles old announcements.
+        self.bot.add_view(ScrimAnnouncement(self))
+        self.bot.add_view(FinalScrimView(self))
+        self.bot.add_dynamic_items(PassiveDraw)
+
+    async def cog_unload(self):
+        self.bot.remove_dynamic_items(PassiveDraw)
+
+    def lock_for(self, guild_id: int) -> asyncio.Lock:
+        return self.guild_locks.setdefault(guild_id, asyncio.Lock())
+
+    def announcement(self, scrim: Scrim, passives_ready: bool = False) -> dict:
+        status = {
+            "signup": f"开始咯，请玩家报名！（{len(scrim.players)}/{PLAYER_COUNT}）",
+            "full": "报名已满，等待主办人确认名单",
+            "teams": "名单已确认，等待主办人分队",
+            "confirmed": "分队已确认",
+        }[scrim.stage]
+        if scrim.stage == "teams" and scrim.team_a:
+            status = "分队预览，等待主办人确认"
+        title = f"**第 {scrim.number} 次趣味瓦内战**"
+        body = teams_text(scrim) if scrim.team_a else roster_text(scrim)
+        if scrim.stage == "confirmed":
+            if scrim.passives_confirmed:
+                selected_map = map_label(scrim.map_name) if scrim.map_name else "待主办人选择"
+                body += f"\n被动已确认 · **比赛地图**　{selected_map}"
+            elif passives_ready:
+                body += "\n10 位玩家已抽完被动，等待主办人确认。"
+            else:
+                body += "\n参赛者也可以在这里抽取本场被动。"
+            view = FinalScrimView(self, scrim, passives_ready)
+        else:
+            view = ScrimAnnouncement(self, scrim.stage == "signup")
+        return {
+            "content": f"{title} {status}\n{body}",
+            "view": view,
+            "allowed_mentions": NO_PINGS,
+        }
+
+    def panel(self, scrim: Scrim, mode: str = "", note: str = "") -> dict:
+        if mode == "remove":
+            body = "选择要移除的成员。空出的名额会重新开放报名。"
+        elif mode == "pick" or (scrim.stage == "teams" and not scrim.team_a):
+            body = "请选择 A 队的 5 名成员，其余 5 人自动进入 B 队。"
+        elif scrim.stage == "confirmed":
+            body = "分队已确认。\n" + teams_text(scrim)
+        else:
+            body = teams_text(scrim) if scrim.team_a else roster_text(scrim)
+        return {
+            "content": f"**第 {scrim.number} 次趣味瓦内战 · 主办人面板**\n{note}{body}",
+            "view": None if scrim.stage == "confirmed" else HostPanel(self, scrim, mode),
+            "allowed_mentions": NO_PINGS,
+        }
+
+    @app_commands.command(name="设置内战频道", description="设置趣味内战公告发布的文字频道")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(channel="发布报名、名单和分队结果的频道")
+    async def set_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        permissions = channel.permissions_for(interaction.guild.me)
+        if not (permissions.view_channel and permissions.send_messages):
+            await interaction.response.send_message("请先给机器人该频道的查看和发送消息权限。", ephemeral=True)
+            return
+        self.db.set_scrim_channel(interaction.guild_id, channel.id)
+        await interaction.response.send_message(f"趣味内战公告将发布到 {channel.mention}。", ephemeral=True)
+
+    @app_commands.command(name="添加内战被动", description="编辑趣味内战的随机被动库")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def set_passives(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(PassivePoolModal(self.db, interaction.guild_id))
+
+    @app_commands.command(name="查看被动列表", description="查看当前服务器用于趣味内战抽取的被动")
+    @app_commands.guild_only()
+    async def list_passives(self, interaction: discord.Interaction):
+        entries = self.db.get_scrim_passives(interaction.guild_id)
+        content = f"**内战被动列表（共 {len(entries)} 条）**"
+        pages = []
+        for index, entry in enumerate(entries, start=1):
+            line = f"{index}. {entry}"
+            if len(f"{content}\n{line}".encode("utf-16-le")) > 4000:
+                pages.append(content)
+                content = line
+            else:
+                content += f"\n{line}"
+        pages.append(content)
+        await interaction.response.send_message(pages[0], ephemeral=True, allowed_mentions=NO_PINGS)
+        for page in pages[1:]:
+            await interaction.followup.send(page, ephemeral=True, allowed_mentions=NO_PINGS)
+
+    @app_commands.command(name="趣味内战", description="发起一场 10 人 VALORANT 趣味内战")
+    @app_commands.guild_only()
+    async def start_scrim(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = interaction.guild_id
+        async with self.lock_for(guild_id):
+            channel_id = self.db.get_scrim_channel(guild_id)
+            channel = interaction.guild.get_channel(channel_id) if channel_id else None
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.edit_original_response(content="请让服务器管理员先使用 /设置内战频道。")
+                return
+            host = interaction.user
+            scrim = Scrim(guild_id, self.db.next_scrim_number(guild_id), channel.id, 0,
+                          host.id, {host.id: host.display_name})
+            try:
+                message = await channel.send(**self.announcement(scrim))
+            except discord.HTTPException:
+                log.exception("Could not post scrim in channel %s", channel.id)
+                await interaction.edit_original_response(content="公告发送失败，请检查机器人在内战频道的权限后重试。")
+                return
+            try:
+                self.db.save_scrim(replace(scrim, message_id=message.id))
+            except Exception:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    log.exception("Could not remove unsaved scrim announcement %s", message.id)
+                raise
+        await interaction.edit_original_response(content=f"报名已发布到 {channel.mention}，你已加入名单。\n{message.jump_url}")
+
+    async def publish(self, previous: Scrim, updated: Scrim, message: discord.PartialMessage):
+        self.db.save_scrim(updated)
+        try:
+            await message.edit(**self.announcement(updated))
+        except discord.HTTPException:
+            self.db.save_scrim(previous)
+            log.exception("Could not update scrim announcement %s", updated.message_id)
+            return False
+        return True
+
+    async def handle_public(self, interaction: discord.Interaction, *, join: bool):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self.lock_for(interaction.guild_id):
+            scrim = self.db.get_scrim(interaction.guild_id, interaction.message.id)
+            user = interaction.user
+            if scrim is None:
+                result = "这场内战的记录已不可用。"
+            elif not join:
+                if user.id == scrim.host_id:
+                    await interaction.edit_original_response(**self.panel(scrim))
+                    return
+                result = "只有本场主办人可以打开管理面板。"
+            elif user.id in scrim.players:
+                result = "你已在参赛名单中。"
+            elif scrim.stage != "signup":
+                result = "本场报名已关闭。"
+            else:
+                players = {**scrim.players, user.id: user.display_name}
+                stage = "full" if len(players) == PLAYER_COUNT else "signup"
+                updated = replace(scrim, players=players, stage=stage, revision=scrim.revision + 1)
+                saved = await self.publish(scrim, updated, interaction.message)
+                result = "报名成功！" if saved else "公告更新失败，报名暂未保存，请重试。"
+        await interaction.edit_original_response(content=result)
+
+    async def handle_host(
+        self, snapshot: Scrim, action: str, interaction: discord.Interaction, values: tuple[int, ...] = (),
+    ):
+        if interaction.user.id != snapshot.host_id or interaction.guild_id != snapshot.guild_id:
+            await interaction.response.send_message("只有本场主办人可以操作。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        async with self.lock_for(snapshot.guild_id):
+            scrim = self.db.get_scrim(snapshot.guild_id, snapshot.message_id)
+            if scrim is None:
+                await interaction.edit_original_response(content="这场内战的记录已不可用。", view=None)
+                return
+            if snapshot.revision != scrim.revision:
+                await interaction.edit_original_response(**self.panel(scrim, note="名单或分队已更新，请重新操作。\n"))
+                return
+            if action in ("show_remove", "show_pick", "back"):
+                mode = {"show_remove": "remove", "show_pick": "pick", "back": ""}[action]
+                await interaction.edit_original_response(**self.panel(scrim, mode))
+                return
+            updated = self.apply_host_action(scrim, action, values)
+            if updated is None:
+                await interaction.edit_original_response(**self.panel(scrim, note="当前状态无法执行这项操作。\n"))
+                return
+            channel = self.bot.get_partial_messageable(scrim.channel_id)
+            message = channel.get_partial_message(scrim.message_id)
+            saved = await self.publish(scrim, updated, message)
+            note = "" if saved else "公告更新失败，本次修改暂未保存，请重试。\n"
+        try:
+            await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
+        finally:
+            if saved and updated.stage == "confirmed":
+                await self.notify_teams(channel, updated)
+
+    async def notify_teams(self, channel: discord.PartialMessageable, scrim: Scrim):
+        for user_id in scrim.players:
+            team = "A" if user_id in scrim.team_a else "B"
+            try:
+                await channel.send(
+                    f"<@{user_id}>，第 {scrim.number} 次趣味瓦内战的主办人 <@{scrim.host_id}> "
+                    f"已将你分配到 **{team} 队**。点击下方按钮抽取你的被动。",
+                    view=draw_view(scrim.message_id, user_id),
+                    allowed_mentions=discord.AllowedMentions(
+                        users=[discord.Object(id=user_id)], roles=False, everyone=False, replied_user=False,
+                    ),
+                )
+            except discord.HTTPException:
+                log.exception("Could not send scrim %s team assignment to %s", scrim.message_id, user_id)
+
+    async def handle_draw(self, interaction: discord.Interaction, round_id: int, recipient_id: int):
+        user_id = interaction.user.id
+        if recipient_id and recipient_id != user_id:
+            await interaction.response.send_message("请使用你自己的通知或分队公告上的按钮。", ephemeral=True)
+            return
+        if interaction.guild_id is None:
+            await interaction.response.send_message("请在内战频道使用这个按钮。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self.lock_for(interaction.guild_id):
+            scrim = self.get_confirmed_scrim(interaction, round_id)
+            if scrim is None:
+                result = "这场内战的抽取暂不可用。"
+            elif user_id not in scrim.players:
+                result = "只有本场参赛者可以抽取被动。"
+            else:
+                passive = self.db.draw_scrim_passive(scrim.guild_id, scrim.message_id, user_id)
+                if passive is None:
+                    result = "暂无可用的被动，请管理员通过 /添加内战被动 补充条目。"
+                else:
+                    result = f"你的被动是：{passive}"
+                    if not await self.publish_passive_table(scrim):
+                        result += "\n公开表格更新失败，可以再次点击按钮重试。"
+        await interaction.edit_original_response(content=result, allowed_mentions=NO_PINGS)
+
+    async def publish_passive_table(self, scrim: Scrim) -> bool:
+        results = self.db.get_scrim_passive_results(scrim.guild_id, scrim.message_id)
+        if not passives_complete(scrim, results):
+            return True
+        table = discord.Embed(title=f"第 {scrim.number} 次趣味瓦内战 · 被动一览")
+        for user_id in scrim.players:
+            team = "A" if user_id in scrim.team_a else "B"
+            table.add_field(name=f"{team} 队", value=f"<@{user_id}> · {results[user_id]}", inline=False)
+        channel = self.bot.get_partial_messageable(scrim.channel_id)
+        try:
+            await channel.get_partial_message(scrim.message_id).edit(
+                embed=table, **self.announcement(scrim, passives_ready=True),
+            )
+        except discord.HTTPException:
+            log.exception("Could not update passive table for scrim %s", scrim.message_id)
+            return False
+        return True
+
+    def get_confirmed_scrim(self, interaction: discord.Interaction, round_id: int) -> Scrim | None:
+        if interaction.guild_id is None:
+            return None
+        scrim = self.db.get_scrim(interaction.guild_id, round_id)
+        if scrim and scrim.stage == "confirmed" and scrim.channel_id == interaction.channel_id:
+            return scrim
+        return None
+
+    async def open_reroll_panel(self, interaction: discord.Interaction):
+        scrim = self.get_confirmed_scrim(interaction, interaction.message.id)
+        if scrim is None or interaction.user.id != scrim.host_id:
+            await interaction.response.send_message("只有本场主办人可以替玩家重抽。", ephemeral=True)
+            return
+        if scrim.passives_confirmed:
+            await interaction.response.send_message("被动已确认，重抽已关闭。", ephemeral=True)
+            return
+        results = self.db.get_scrim_passive_results(scrim.guild_id, scrim.message_id)
+        if not results.keys() & scrim.players.keys():
+            await interaction.response.send_message("还没有玩家抽取被动。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "选择一位已抽取的玩家，为该玩家换一条尚未被占用的被动。",
+            view=RerollPanel(self, scrim, results),
+            ephemeral=True,
+        )
+
+    async def reroll_passive(self, interaction: discord.Interaction, round_id: int, user_id: int):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild_id is None:
+            await interaction.edit_original_response(content="只有本场主办人可以替玩家重抽。")
+            return
+        async with self.lock_for(interaction.guild_id):
+            scrim = self.get_confirmed_scrim(interaction, round_id)
+            if scrim is None or interaction.user.id != scrim.host_id:
+                await interaction.edit_original_response(content="只有本场主办人可以替玩家重抽。")
+                return
+            if scrim.passives_confirmed:
+                await interaction.edit_original_response(content="被动已确认，重抽已关闭。")
+                return
+            results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
+            if user_id not in scrim.players or user_id not in results:
+                result = "这位玩家还没有抽取被动。"
+            else:
+                passive = self.db.draw_scrim_passive(scrim.guild_id, round_id, user_id, reroll=True)
+                if passive is None:
+                    result = "没有空闲的被动可以重抽，请先通过 /添加内战被动 补充条目。"
+                else:
+                    result = f"已为 <@{user_id}> 重抽。新被动是：{passive}"
+                    if not await self.publish_passive_table(scrim):
+                        result += "\n公开表格更新失败。参赛者再次点击「抽取被动」即可重试更新。"
+        await interaction.edit_original_response(content=result, allowed_mentions=NO_PINGS)
+
+    async def handle_map_setup(
+        self, interaction: discord.Interaction, round_id: int, action: str, map_name: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild_id is None:
+            await interaction.edit_original_response(content="请在内战频道使用这个按钮。")
+            return
+        async with self.lock_for(interaction.guild_id):
+            scrim = self.get_confirmed_scrim(interaction, round_id)
+            if scrim is None or interaction.user.id != scrim.host_id:
+                await interaction.edit_original_response(content="只有本场主办人可以确认被动或选图。")
+                return
+            if action == "confirm":
+                results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
+                if not passives_complete(scrim, results):
+                    await interaction.edit_original_response(content="请等 10 名玩家抽完各自的被动。")
+                    return
+                updated = replace(scrim, passives_confirmed=True)
+                result = "已确认被动。现在可以抽取地图或手动选择地图。"
+            elif not scrim.passives_confirmed:
+                await interaction.edit_original_response(content="请先确认本场被动。")
+                return
+            elif action == "picker":
+                await interaction.edit_original_response(content="请选择本场地图。", view=MapPicker(self, scrim))
+                return
+            else:
+                selected = choice(tuple(VALORANT_MAPS)) if action == "random" else map_name
+                if selected not in VALORANT_MAPS:
+                    await interaction.edit_original_response(content="请选择地图列表中的选项。")
+                    return
+                updated = replace(scrim, map_name=selected)
+                result = f"本场比赛地图为 **{map_label(selected)}**。"
+            self.db.save_scrim(updated)
+            if not await self.publish_passive_table(updated):
+                self.db.save_scrim(scrim)
+                result = "公告更新失败，操作暂未保存，请重试。"
+        await interaction.edit_original_response(content=result)
+
+    @staticmethod
+    def apply_host_action(scrim: Scrim, action: str, values: tuple[int, ...]) -> Scrim | None:
+        revision = scrim.revision + 1
+        if action == "remove" and scrim.stage in ("signup", "full") and len(values) == 1:
+            user_id = values[0]
+            if user_id in scrim.players and user_id != scrim.host_id:
+                players = {uid: name for uid, name in scrim.players.items() if uid != user_id}
+                return replace(scrim, players=players, stage="signup", revision=revision)
+        if action == "start" and scrim.stage == "full" and len(scrim.players) == PLAYER_COUNT:
+            return replace(scrim, stage="teams", revision=revision)
+        if action == "pick" and scrim.stage == "teams":
+            selected = set(values)
+            if len(values) == len(selected) == TEAM_SIZE and selected.issubset(scrim.players):
+                return replace(scrim, team_a=values, revision=revision)
+        if action == "confirm" and scrim.stage == "teams" and scrim.team_a:
+            return replace(scrim, stage="confirmed", revision=revision)
+        return None

@@ -7,12 +7,23 @@ from database import Database
 from cogs.ledger import Ledger
 from cogs.guild_config import GuildConfig
 from cogs.events import Events
+from cogs.scrims import Scrims
 
 intents = discord.Intents.default()
 intents.members = True        # 监听成员加入/离开（需在 Developer Portal 开启 Server Members Intent）
 intents.voice_states = True   # 监听语音频道变化
-bot = commands.Bot(command_prefix="!", intents=intents)
 db = Database()
+
+
+class TracyBot(commands.Bot):
+    async def setup_hook(self):
+        await self.add_cog(Ledger(self, db))
+        await self.add_cog(GuildConfig(self, db))
+        await self.add_cog(Events(self, db))
+        await self.add_cog(Scrims(self, db))
+
+
+bot = TracyBot(command_prefix="!", intents=intents)
 
 
 async def apply_guild_nickname(guild: discord.Guild):
@@ -27,10 +38,6 @@ async def apply_guild_nickname(guild: discord.Guild):
 @bot.event
 async def on_ready():
     try:
-        await bot.add_cog(Ledger(bot, db))
-        await bot.add_cog(GuildConfig(bot, db))
-        await bot.add_cog(Events(bot, db))
-
         # 同步到所有已加入的服务器（立即生效，无需等待全局传播）
         for guild in bot.guilds:
             try:

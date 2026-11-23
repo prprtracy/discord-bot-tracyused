@@ -1,7 +1,12 @@
+import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from random import choice
 from typing import Optional
+
+from scrim_passives import DEFAULT_SCRIM_PASSIVES
 
 
 @dataclass
@@ -63,6 +68,21 @@ class GuildSettings:
     leave_channel_id: Optional[int] = None    # 成员离开通知频道
 
 
+@dataclass
+class Scrim:
+    guild_id: int
+    number: int
+    channel_id: int
+    message_id: int
+    host_id: int
+    players: dict[int, str]
+    stage: str = "signup"
+    team_a: tuple[int, ...] = ()
+    revision: int = 0
+    passives_confirmed: bool = False
+    map_name: str | None = None
+
+
 class Database:
     def __init__(self, path: str = DB_PATH):
         self.path = path
@@ -72,8 +92,52 @@ class Database:
         return sqlite3.connect(self.path)
 
     def _init_tables(self):
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             self._migrate(conn)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrim_channels (
+                    guild_id INTEGER PRIMARY KEY,
+                    channel_id INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrims (
+                    guild_id INTEGER NOT NULL,
+                    number INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    host_id INTEGER NOT NULL,
+                    players TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    team_a TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    passives_confirmed INTEGER NOT NULL DEFAULT 0,
+                    map_name TEXT,
+                    PRIMARY KEY (guild_id, message_id),
+                    UNIQUE (guild_id, number)
+                )
+            """)
+            scrim_columns = {row[1] for row in conn.execute("PRAGMA table_info(scrims)")}
+            if "passives_confirmed" not in scrim_columns:
+                conn.execute("ALTER TABLE scrims ADD COLUMN passives_confirmed INTEGER NOT NULL DEFAULT 0")
+            if "map_name" not in scrim_columns:
+                conn.execute("ALTER TABLE scrims ADD COLUMN map_name TEXT")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrim_passive_pools (
+                    guild_id INTEGER PRIMARY KEY,
+                    entries TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrim_passive_results (
+                    guild_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    passive TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, message_id, user_id)
+                )
+            """)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS companions (
@@ -144,6 +208,109 @@ class Database:
                 conn.execute("ALTER TABLE bindings ADD COLUMN dcid TEXT")
             except Exception:
                 pass
+
+    def get_scrim_channel(self, guild_id: int) -> Optional[int]:
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT channel_id FROM scrim_channels WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_scrim_channel(self, guild_id: int, channel_id: int):
+        with closing(self._conn()) as conn, conn:
+            conn.execute("""
+                INSERT INTO scrim_channels VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+            """, (guild_id, channel_id))
+
+    def next_scrim_number(self, guild_id: int) -> int:
+        with closing(self._conn()) as conn:
+            return conn.execute(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM scrims WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()[0]
+
+    def get_scrim(self, guild_id: int, message_id: int) -> Optional[Scrim]:
+        with closing(self._conn()) as conn:
+            row = conn.execute("""
+                SELECT guild_id, number, channel_id, message_id, host_id,
+                       players, stage, team_a, revision, passives_confirmed, map_name
+                FROM scrims WHERE guild_id = ? AND message_id = ?
+            """, (guild_id, message_id)).fetchone()
+        if row is None:
+            return None
+        players = {int(user_id): name for user_id, name in json.loads(row[5]).items()}
+        return Scrim(*row[:5], players, row[6], tuple(json.loads(row[7])), row[8], bool(row[9]), row[10])
+
+    def save_scrim(self, scrim: Scrim):
+        with closing(self._conn()) as conn, conn:
+            conn.execute("""
+                INSERT INTO scrims
+                    (guild_id, number, channel_id, message_id, host_id,
+                     players, stage, team_a, revision, passives_confirmed, map_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, message_id) DO UPDATE SET
+                    players = excluded.players,
+                    stage = excluded.stage,
+                    team_a = excluded.team_a,
+                    revision = excluded.revision,
+                    passives_confirmed = excluded.passives_confirmed,
+                    map_name = excluded.map_name
+            """, (
+                scrim.guild_id, scrim.number, scrim.channel_id, scrim.message_id,
+                scrim.host_id, json.dumps(scrim.players), scrim.stage,
+                json.dumps(scrim.team_a), scrim.revision, scrim.passives_confirmed, scrim.map_name,
+            ))
+
+    def _scrim_passives(self, conn: sqlite3.Connection, guild_id: int) -> list[str]:
+        row = conn.execute(
+            "SELECT entries FROM scrim_passive_pools WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return json.loads(row[0]) if row else list(DEFAULT_SCRIM_PASSIVES)
+
+    def get_scrim_passives(self, guild_id: int) -> list[str]:
+        with closing(self._conn()) as conn:
+            return self._scrim_passives(conn, guild_id)
+
+    def set_scrim_passives(self, guild_id: int, entries: list[str]):
+        with closing(self._conn()) as conn, conn:
+            conn.execute("""
+                INSERT INTO scrim_passive_pools VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET entries = excluded.entries
+            """, (guild_id, json.dumps(entries)))
+
+    def _scrim_passive_results(self, conn: sqlite3.Connection, guild_id: int, message_id: int) -> dict[int, str]:
+        return dict(conn.execute("""
+            SELECT user_id, passive FROM scrim_passive_results
+            WHERE guild_id = ? AND message_id = ?
+        """, (guild_id, message_id)))
+
+    def get_scrim_passive_results(self, guild_id: int, message_id: int) -> dict[int, str]:
+        with closing(self._conn()) as conn:
+            return self._scrim_passive_results(conn, guild_id, message_id)
+
+    def draw_scrim_passive(
+        self, guild_id: int, message_id: int, user_id: int, *, reroll: bool = False,
+    ) -> Optional[str]:
+        with closing(self._conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            results = self._scrim_passive_results(conn, guild_id, message_id)
+            previous = results.get(user_id)
+            if not reroll:
+                if previous is not None:
+                    return previous
+            elif previous is None:
+                return None
+            taken = set(results.values())
+            available = [entry for entry in self._scrim_passives(conn, guild_id) if entry not in taken]
+            if not available:
+                return None
+            passive = choice(available)
+            conn.execute("""
+                INSERT INTO scrim_passive_results VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, message_id, user_id) DO UPDATE SET passive = excluded.passive
+            """, (guild_id, message_id, user_id, passive))
+            return passive
 
     def _migrate(self, conn: sqlite3.Connection):
         """
