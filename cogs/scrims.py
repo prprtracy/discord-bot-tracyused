@@ -671,10 +671,7 @@ class Scrims(commands.Cog):
         self, scrim: Scrim, map_name: str, results: dict[int, str],
     ) -> int:
         image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
-        map_card = discord.Embed(
-            title=f"第 {scrim.number} 次趣味瓦内战 · 开始比赛",
-            description=f"**{map_label(map_name)}**",
-        )
+        heading = f"第 {scrim.number} 次趣味瓦内战 · **开始比赛**\n{map_label(map_name)}"
         players = await self.load_card_players(scrim, scrim.players, results)
         card_teams = {"A": [], "B": []}
         team_rows: dict[str, list[str]] = {"A": [], "B": []}
@@ -695,8 +692,7 @@ class Scrims(commands.Cog):
             log.exception("Matchup rendering failed for scrim %s", scrim.message_id)
             artwork = image_path.read_bytes()
             filename = image_path.name
-        map_card.set_image(url=f"attachment://{filename}")
-        embeds = [map_card] + [
+        embeds = [
             discord.Embed(title=f"{team} 队", description="\n".join(rows) or "暂无成员")
             for team, rows in team_rows.items()
         ]
@@ -706,13 +702,13 @@ class Scrims(commands.Cog):
             message = channel.get_partial_message(scrim.map_announcement_id)
             try:
                 with closing(discord.File(BytesIO(artwork), filename=filename)) as image:
-                    await message.edit(embeds=embeds, attachments=[image], allowed_mentions=NO_PINGS)
+                    await message.edit(content=heading, embeds=embeds, attachments=[image], allowed_mentions=NO_PINGS)
             except discord.NotFound:
                 pass  # Recreate the announcement if it was deleted.
             else:
                 return scrim.map_announcement_id
         with closing(discord.File(BytesIO(artwork), filename=filename)) as image:
-            message = await channel.send(embeds=embeds, file=image, allowed_mentions=NO_PINGS)
+            message = await channel.send(content=heading, embeds=embeds, file=image, allowed_mentions=NO_PINGS)
         return message.id
 
     def get_confirmed_scrim(self, interaction: discord.Interaction, round_id: int) -> Scrim | None:
