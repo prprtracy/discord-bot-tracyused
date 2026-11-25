@@ -70,9 +70,11 @@ def passives_complete(scrim: Scrim, results: dict[int, str]) -> bool:
 
 
 class ScrimAnnouncement(discord.ui.View):
-    def __init__(self, cog: "Scrims", signup_open: bool = True):
+    def __init__(self, cog: "Scrims", signup_open: bool = True, *, legacy: bool = False):
         super().__init__(timeout=None)
         self.cog = cog
+        if not legacy:
+            self.remove_item(self.manage)
         if not signup_open:
             self.remove_item(self.join)
 
@@ -234,9 +236,8 @@ class HostPanel(discord.ui.View):
         elif mode == "pick":
             self.add_picker(f"选择 A 队的 {a_size} 名成员", "pick", a_size)
         elif scrim.stage in ("signup", "full"):
-            if len(scrim.players) > 1:
-                self.add_button("删除用户", "show_remove", discord.ButtonStyle.danger)
             self.add_button("确认列表，开始分队", "start", discord.ButtonStyle.success)
+            self.add_button("删除用户", "show_remove", discord.ButtonStyle.danger)
         elif scrim.stage == "teams" and scrim.team_a:
             self.add_button("确认分队", "confirm", discord.ButtonStyle.success)
             self.add_button("修改分队", "show_pick", discord.ButtonStyle.secondary)
@@ -278,10 +279,11 @@ class Scrims(commands.Cog):
         self.db = db
         self.guild_locks: dict[int, asyncio.Lock] = {}
         self.signup_interactions: dict[tuple[int, int], discord.Interaction] = {}
+        self.host_panels: dict[int, discord.Interaction] = {}
 
     async def cog_load(self):
         # The message ID identifies the round, so one fallback view handles old announcements.
-        self.bot.add_view(ScrimAnnouncement(self))
+        self.bot.add_view(ScrimAnnouncement(self, legacy=True))
         self.bot.add_view(FinalScrimView(self))
         self.bot.add_dynamic_items(PassiveDraw)
 
@@ -397,14 +399,33 @@ class Scrims(commands.Cog):
                 await interaction.edit_original_response(content="公告发送失败，请检查机器人在内战频道的权限后重试。")
                 return
             try:
-                self.db.save_scrim(replace(scrim, message_id=message.id))
+                scrim = replace(scrim, message_id=message.id)
+                self.db.save_scrim(scrim)
             except Exception:
                 try:
                     await message.delete()
                 except discord.HTTPException:
                     log.exception("Could not remove unsaved scrim announcement %s", message.id)
                 raise
-        await interaction.edit_original_response(content=f"报名已发布到 {channel.mention}，你已加入名单。\n{message.jump_url}")
+            await interaction.edit_original_response(**self.panel(scrim, note=f"报名已发布到 {channel.mention}。{message.jump_url}\n"))
+            self.remember_host_panel(scrim, interaction)
+
+    def remember_host_panel(self, scrim: Scrim, interaction: discord.Interaction):
+        self.host_panels = {key: value for key, value in self.host_panels.items() if not value.is_expired()}
+        self.host_panels[scrim.message_id] = interaction
+
+    @app_commands.command(name="内战管理", description="重新打开自己主办场次的私密管理按钮")
+    @app_commands.guild_only()
+    @app_commands.describe(number="公告上的内战场次编号")
+    async def reopen_panel(self, interaction: discord.Interaction, number: int):
+        await interaction.response.defer(ephemeral=True)
+        async with self.lock_for(interaction.guild_id):
+            scrim = self.db.get_host_scrim(interaction.guild_id, interaction.user.id, number)
+            if not scrim or scrim.stage == "confirmed":
+                await interaction.edit_original_response(content="没有可管理的对应场次。")
+                return
+            await interaction.edit_original_response(**self.panel(scrim))
+            self.remember_host_panel(scrim, interaction)
 
     async def publish(self, previous: Scrim, updated: Scrim, message: discord.PartialMessage):
         self.db.save_scrim(updated)
@@ -439,6 +460,12 @@ class Scrims(commands.Cog):
                 stage = "full" if len(players) == PLAYER_COUNT else "signup"
                 updated = replace(scrim, players=players, stage=stage, revision=scrim.revision + 1)
                 saved = await self.publish(scrim, updated, interaction.message)
+                panel = self.host_panels.get(scrim.message_id)
+                if saved and panel and not panel.is_expired():
+                    try:
+                        await panel.edit_original_response(**self.panel(updated))
+                    except discord.HTTPException:
+                        log.info("Could not refresh private roster for %s", scrim.message_id)
                 remember_signup = saved
                 result = "报名成功！" if saved else "公告更新失败，报名暂未保存，请重试。"
             await interaction.edit_original_response(content=result)
@@ -460,10 +487,15 @@ class Scrims(commands.Cog):
             if scrim is None:
                 await interaction.edit_original_response(content="这场内战的记录已不可用。", view=None)
                 return
-            if snapshot.revision != scrim.revision:
+            if snapshot.revision != scrim.revision and not (
+                action in ("start", "show_remove") and scrim.stage in ("signup", "full")
+            ):
                 await interaction.edit_original_response(**self.panel(scrim, note="名单或分队已更新，请重新操作。\n"))
                 return
             if action in ("show_remove", "show_pick", "back"):
+                if action == "show_remove" and len(scrim.players) == 1:
+                    await interaction.edit_original_response(**self.panel(scrim, note="目前只有主办人，没有可删除的成员。\n"))
+                    return
                 mode = {"show_remove": "remove", "show_pick": "pick", "back": ""}[action]
                 await interaction.edit_original_response(**self.panel(scrim, mode))
                 return
@@ -477,11 +509,12 @@ class Scrims(commands.Cog):
             note = "" if saved else "公告更新失败，本次修改暂未保存，请重试。\n"
         await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
         if saved and updated.stage == "confirmed":
+            self.host_panels.pop(updated.message_id, None)
             failed = []
             for user_id in updated.players:
                 signup = self.signup_interactions.pop((updated.message_id, user_id), None)
                 target = interaction if user_id == updated.host_id else signup
-                if target is None or target.is_expired():
+                if target is None or target.is_expired() or target.channel_id != updated.channel_id:
                     failed.append(f"<@{user_id}>")
                     continue
                 try:

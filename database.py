@@ -234,6 +234,12 @@ class Database:
                 (guild_id,),
             ).fetchone()[0]
 
+    def get_host_scrim(self, guild_id: int, host_id: int, number: int) -> Optional[Scrim]:
+        with closing(self._conn()) as conn:
+            row = conn.execute("SELECT message_id FROM scrims WHERE guild_id=? AND host_id=? AND number=?",
+                               (guild_id, host_id, number)).fetchone()
+        return self.get_scrim(guild_id, row[0]) if row else None
+
     def get_scrim(self, guild_id: int, message_id: int) -> Optional[Scrim]:
         with closing(self._conn()) as conn:
             row = conn.execute("""
