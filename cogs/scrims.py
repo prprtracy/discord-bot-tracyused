@@ -111,6 +111,22 @@ class PassiveDraw(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:pa
             await cog.handle_draw(interaction, self.round_id, self.recipient_id, self.guild_id)
 
 
+class EndMatch(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:end:(?P<round_id>\d+)"):
+    def __init__(self, round_id: int):
+        self.round_id = round_id
+        super().__init__(discord.ui.Button(label="结束对战", style=discord.ButtonStyle.danger,
+                                           custom_id=f"scrim:end:{round_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["round_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("Scrims")
+        if cog:
+            await cog.handle_map_setup(interaction, self.round_id, "end")
+
+
 def assignment_notice(scrim: Scrim, user_id: int) -> dict:
     view = discord.ui.View(timeout=None)
     view.add_item(PassiveDraw(scrim.message_id, user_id, scrim.guild_id))
@@ -253,7 +269,6 @@ class HostPanel(discord.ui.View):
                 self.add_map_button("开始比赛", "match", discord.ButtonStyle.success)
         elif scrim.stage == "confirmed":
             self.add_map_button("修改地图", "picker", discord.ButtonStyle.secondary)
-            self.add_map_button("结束对战", "end", discord.ButtonStyle.danger)
 
     def add_map_button(self, label: str, action: str, style: discord.ButtonStyle):
         button = discord.ui.Button(label=label, style=style)
@@ -301,10 +316,10 @@ class Scrims(commands.Cog):
         # The message ID identifies the round, so one fallback view handles old announcements.
         self.bot.add_view(ScrimAnnouncement(self, legacy=True))
         self.bot.add_view(FinalScrimView(self))
-        self.bot.add_dynamic_items(PassiveDraw)
+        self.bot.add_dynamic_items(PassiveDraw, EndMatch)
 
     async def cog_unload(self):
-        self.bot.remove_dynamic_items(PassiveDraw)
+        self.bot.remove_dynamic_items(PassiveDraw, EndMatch)
 
     def lock_for(self, guild_id: int) -> asyncio.Lock:
         return self.guild_locks.setdefault(guild_id, asyncio.Lock())
@@ -451,6 +466,19 @@ class Scrims(commands.Cog):
                 return
             await interaction.edit_original_response(**self.panel(scrim))
             self.remember_host_panel(scrim, interaction)
+
+        if scrim.map_announcement_id is not None:
+            await self.send_end_button(interaction, scrim)
+
+    async def send_end_button(self, interaction: discord.Interaction, scrim: Scrim):
+        view = discord.ui.View(timeout=None)
+        view.add_item(EndMatch(scrim.message_id))
+        try:
+            await interaction.followup.send(f"第 {scrim.number} 次趣味瓦内战 · 赛后结算", view=view, ephemeral=True)
+        except discord.HTTPException:
+            await interaction.edit_original_response(**self.panel(
+                scrim, note=f"赛后请用 /内战管理 输入 {scrim.number} 重新领取结束按钮。\n",
+            ))
 
     async def publish(self, previous: Scrim, updated: Scrim, message: discord.PartialMessage):
         self.db.save_scrim(updated)
@@ -636,9 +664,9 @@ class Scrims(commands.Cog):
                 continue
             for member in list(room.members):
                 if member.id not in scrim.players:
-                    return "队伍频道里还有非参赛成员，请等其离开，再点「结束对战」。"
+                    return "队伍频道里还有非参赛成员，请等其离开，再选择胜方重试。"
                 if origin is None:
-                    return "原集合频道不可用，请先让队员离开队伍频道，再点「结束对战」清理空频道。"
+                    return "原集合频道不可用，请先让队员离开队伍频道，再选择胜方以清理空频道。"
                 await member.move_to(origin, reason=f"第 {scrim.number} 场内战结束")
             await room.delete(reason=f"第 {scrim.number} 场内战结束")
         return ""
@@ -798,9 +826,9 @@ class Scrims(commands.Cog):
                     issue = await self.return_voice_members(interaction.guild, scrim)
                 except discord.HTTPException:
                     log.exception("Could not finish voice cleanup for scrim %s", round_id)
-                    issue = "语音归队或清理失败。请检查「移动成员」「连接」「管理频道」权限及集合频道容量，再点「结束对战」。"
+                    issue = "语音归队或清理失败。请检查「移动成员」「连接」「管理频道」权限及集合频道容量，再选择胜方重试。"
                 if issue:
-                    await interaction.edit_original_response(**self.panel(scrim, note=issue + "\n"))
+                    await interaction.edit_original_response(**self.panel(scrim, "winner", note=issue + "\n"))
                     return
                 try:
                     await self.publish_victory(scrim, team, roster)
@@ -879,6 +907,8 @@ class Scrims(commands.Cog):
                     result += "\n原报名公告刷新失败，对战公告仍可在频道中查看。"
         panel_state = updated if published or updated.map_announcement_id is not None else scrim
         await interaction.edit_original_response(**self.panel(panel_state, note=result + "\n"))
+        if action == "match":
+            await self.send_end_button(interaction, updated)
 
     @staticmethod
     def apply_host_action(scrim: Scrim, action: str, values: tuple[int, ...]) -> Scrim | None:
