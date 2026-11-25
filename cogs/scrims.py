@@ -127,15 +127,9 @@ class FinalScrimView(discord.ui.View):
             return
         self.remove_item(self.reroll)
         self.remove_item(self.confirm_passives)
-        if not scrim.passives_confirmed or not scrim.map_name or scrim.map_announcement_id is not None:
-            self.remove_item(self.match_found)
-        if scrim.passives_confirmed:
-            if scrim.map_announcement_id is not None:
-                self.remove_item(self.random_map)
-                self.remove_item(self.choose_map)
-        else:
-            self.remove_item(self.random_map)
-            self.remove_item(self.choose_map)
+        self.remove_item(self.match_found)
+        self.remove_item(self.random_map)
+        self.remove_item(self.choose_map)
 
     @discord.ui.button(label="查看我的分队", style=discord.ButtonStyle.primary, custom_id="scrim:my-team")
     async def my_team(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -157,7 +151,7 @@ class FinalScrimView(discord.ui.View):
     async def choose_map(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.handle_map_setup(interaction, interaction.message.id, "picker")
 
-    @discord.ui.button(label="Match Found", style=discord.ButtonStyle.success, custom_id="scrim:match-found")
+    @discord.ui.button(label="开始比赛", style=discord.ButtonStyle.success, custom_id="scrim:match-found")
     async def match_found(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.handle_map_setup(interaction, interaction.message.id, "match")
 
@@ -245,9 +239,17 @@ class HostPanel(discord.ui.View):
             reroll = discord.ui.Button(label="主办人重抽")
             reroll.callback = partial(cog.open_reroll_panel, round_id=scrim.message_id)
             self.add_item(reroll)
-            confirm = discord.ui.Button(label="确认被动", style=discord.ButtonStyle.success)
-            confirm.callback = partial(cog.handle_map_setup, round_id=scrim.message_id, action="confirm")
-            self.add_item(confirm)
+            self.add_map_button("确认被动", "confirm", discord.ButtonStyle.success)
+        elif scrim.stage == "confirmed" and scrim.map_announcement_id is None:
+            self.add_map_button("抽取地图", "random", discord.ButtonStyle.primary)
+            self.add_map_button("手动选择地图", "picker", discord.ButtonStyle.secondary)
+            if scrim.map_name:
+                self.add_map_button("开始比赛", "match", discord.ButtonStyle.success)
+
+    def add_map_button(self, label: str, action: str, style: discord.ButtonStyle):
+        button = discord.ui.Button(label=label, style=style)
+        button.callback = partial(self.cog.handle_map_setup, round_id=self.scrim.message_id, action=action)
+        self.add_item(button)
 
     def add_button(self, label: str, action: str, style: discord.ButtonStyle):
         button = discord.ui.Button(label=label, style=style)
@@ -314,7 +316,7 @@ class Scrims(commands.Cog):
                 selected_map = map_label(scrim.map_name) if scrim.map_name else "待主办人选择"
                 body += f"\n被动已确认 · **比赛地图**　{selected_map}"
                 if scrim.map_name:
-                    body += "\n对战已确认。" if scrim.map_announcement_id else "\n地图已确认，等待主办人点击「Match Found」发布对战图。"
+                    body += "\n对战已确认。" if scrim.map_announcement_id else "\n地图已确认，等待主办人开始比赛。"
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
@@ -337,11 +339,13 @@ class Scrims(commands.Cog):
             body = f"请选择 A 队的 {a_size} 名成员，其余 {b_size} 人自动进入 B 队。"
         elif scrim.stage == "confirmed":
             body = "分队已确认。\n" + teams_text(scrim)
+            if scrim.map_name:
+                body += f"\n比赛地图：**{map_label(scrim.map_name)}**"
         else:
             body = teams_text(scrim) if scrim.team_a else roster_text(scrim)
         return {
             "content": f"**第 {scrim.number} 次趣味瓦内战 · 主办人面板**\n{note}{body}",
-            "view": None if scrim.passives_confirmed else HostPanel(self, scrim, mode),
+            "view": None if scrim.map_announcement_id is not None else HostPanel(self, scrim, mode),
             "allowed_mentions": NO_PINGS,
         }
 
@@ -426,7 +430,7 @@ class Scrims(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         async with self.lock_for(interaction.guild_id):
             scrim = self.db.get_host_scrim(interaction.guild_id, interaction.user.id, number)
-            if not scrim or scrim.passives_confirmed:
+            if not scrim or scrim.map_announcement_id is not None:
                 await interaction.edit_original_response(content="没有可管理的对应场次。")
                 return
             await interaction.edit_original_response(**self.panel(scrim))
@@ -589,7 +593,7 @@ class Scrims(commands.Cog):
     ) -> int:
         image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
         map_card = discord.Embed(
-            title=f"第 {scrim.number} 次趣味瓦内战 · Match Found",
+            title=f"第 {scrim.number} 次趣味瓦内战 · 开始比赛",
             description=f"**{map_label(map_name)}**",
         )
         guild = self.bot.get_guild(scrim.guild_id)
@@ -701,8 +705,8 @@ class Scrims(commands.Cog):
     async def handle_map_setup(
         self, interaction: discord.Interaction, round_id: int, action: str, map_name: str | None = None,
     ):
-        private_confirm = action == "confirm" and interaction.message.id != round_id
-        await interaction.response.defer(ephemeral=True, thinking=not private_confirm)
+        private_panel = interaction.message.flags.ephemeral
+        await interaction.response.defer(ephemeral=True, thinking=not private_panel)
         if interaction.guild_id is None:
             await interaction.edit_original_response(content="请在内战频道使用这个按钮。")
             return
@@ -749,7 +753,7 @@ class Scrims(commands.Cog):
                     await interaction.edit_original_response(content="请选择地图列表中的选项。")
                     return
                 updated = replace(scrim, map_name=selected)
-                result = f"地图已确认：**{map_label(selected)}**。点击内战公告上的「Match Found」发布对战图。"
+                result = f"地图已确认：**{map_label(selected)}**。点击「开始比赛」发布对战图。"
             self.db.save_scrim(updated)
             published = await self.publish_passive_table(updated)
             if not published:
@@ -758,10 +762,8 @@ class Scrims(commands.Cog):
                     result = "公告更新失败，操作暂未保存，请重试。"
                 else:
                     result += "\n原报名公告刷新失败，对战公告仍可在频道中查看。"
-        if private_confirm and published:
-            await interaction.edit_original_response(content=result, view=None)
-        else:
-            await interaction.edit_original_response(content=result)
+        panel_state = updated if published or action == "match" else scrim
+        await interaction.edit_original_response(**self.panel(panel_state, note=result + "\n"))
 
     @staticmethod
     def apply_host_action(scrim: Scrim, action: str, values: tuple[int, ...]) -> Scrim | None:
