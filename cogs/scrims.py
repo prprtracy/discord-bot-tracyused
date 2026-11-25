@@ -591,6 +591,23 @@ class Scrims(commands.Cog):
             return False
         return True
 
+    async def ensure_team_voice_channels(self, guild: discord.Guild, scrim: Scrim):
+        lobby = guild.get_channel(scrim.channel_id) or await guild.fetch_channel(scrim.channel_id)
+        existing = self.db.get_scrim_voice_channels(scrim.message_id)
+        for team in ("A", "B"):
+            if team in existing:
+                try:
+                    channel = guild.get_channel(existing[team]) or await guild.fetch_channel(existing[team])
+                except discord.NotFound:
+                    pass
+                else:
+                    if isinstance(channel, discord.VoiceChannel):
+                        continue
+            channel = await guild.create_voice_channel(
+                f"内战{team}队", category=lobby.category, reason=f"第 {scrim.number} 次趣味瓦内战",
+            )
+            self.db.save_scrim_voice_channel(scrim.message_id, team, channel.id)
+
     async def publish_map_announcement(
         self, scrim: Scrim, map_name: str, results: dict[int, str],
     ) -> int:
@@ -744,6 +761,15 @@ class Scrims(commands.Cog):
                 if not passives_complete(scrim, results):
                     await interaction.edit_original_response(content="被动结果不完整，暂时无法发布地图公告。")
                     return
+                if action == "match":
+                    try:
+                        await self.ensure_team_voice_channels(interaction.guild, scrim)
+                    except discord.HTTPException:
+                        log.exception("Could not prepare team voice channels for scrim %s", round_id)
+                        await interaction.edit_original_response(**self.panel(
+                            scrim, note="语音频道尚未准备好。请检查机器人的「管理频道」权限和分类容量，再点「开始比赛」重试。\n",
+                        ))
+                        return
                 try:
                     announcement_id = await self.publish_map_announcement(scrim, selected, results)
                 except discord.HTTPException:

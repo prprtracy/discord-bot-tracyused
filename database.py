@@ -121,6 +121,14 @@ class Database:
                 )
             """)
             scrim_columns = {row[1] for row in conn.execute("PRAGMA table_info(scrims)")}
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrim_voice_channels (
+                    message_id INTEGER NOT NULL,
+                    team TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    PRIMARY KEY (message_id, team)
+                )
+            """)
             if "passives_confirmed" not in scrim_columns:
                 conn.execute("ALTER TABLE scrims ADD COLUMN passives_confirmed INTEGER NOT NULL DEFAULT 0")
             if "map_name" not in scrim_columns:
@@ -273,6 +281,16 @@ class Database:
                 json.dumps(scrim.team_a), scrim.revision, scrim.passives_confirmed, scrim.map_name,
                 scrim.map_announcement_id,
             ))
+
+    def get_scrim_voice_channels(self, message_id: int) -> dict[str, int]:
+        with closing(self._conn()) as conn:
+            return dict(conn.execute("SELECT team, channel_id FROM scrim_voice_channels WHERE message_id = ?",
+                                     (message_id,)))
+
+    def save_scrim_voice_channel(self, message_id: int, team: str, channel_id: int):
+        with closing(self._conn()) as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO scrim_voice_channels VALUES (?, ?, ?)",
+                         (message_id, team, channel_id))
 
     def _scrim_passives(self, conn: sqlite3.Connection, guild_id: int) -> list[str]:
         row = conn.execute(
