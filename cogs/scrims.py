@@ -1,7 +1,9 @@
 import asyncio
 import logging
+from contextlib import closing
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from random import choice
 
 import discord
@@ -29,7 +31,7 @@ VALORANT_MAPS = {
     "Summit": ("頂峰亭閣", "news_live/ff7f89ff681da27cfec24bf61986c23fb2aba543-1920x1080.jpg"),
     "Sunset": ("日落之城", "news/5101e4ee241fbfca261bf8150230236c46c8b991-3840x2160.png"),
 }
-RIOT_MAP_IMAGE_BASE = "https://cmsassets.rgpub.io/sanity/images/dsfx7636/"
+MAP_IMAGE_DIR = Path(__file__).resolve().parents[1] / "assets" / "scrim_maps"
 NO_PINGS = discord.AllowedMentions.none()
 log = logging.getLogger(__name__)
 
@@ -100,7 +102,7 @@ class PassiveDraw(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:pa
             await cog.handle_draw(interaction, self.round_id, self.recipient_id)
 
 
-def draw_view(round_id: int, recipient_id: int = 0) -> discord.ui.View:
+def draw_view(round_id: int, recipient_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(PassiveDraw(round_id, recipient_id))
     return view
@@ -112,7 +114,6 @@ class FinalScrimView(discord.ui.View):
         self.cog = cog
         if scrim is None:
             return
-        self.add_item(PassiveDraw(scrim.message_id))
         if scrim.passives_confirmed:
             self.remove_item(self.reroll)
             self.remove_item(self.confirm_passives)
@@ -121,6 +122,10 @@ class FinalScrimView(discord.ui.View):
             self.remove_item(self.choose_map)
             if not passives_ready:
                 self.remove_item(self.confirm_passives)
+
+    @discord.ui.button(label="查看我的分队", style=discord.ButtonStyle.primary, custom_id="scrim:my-team")
+    async def my_team(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.show_my_team(interaction)
 
     @discord.ui.button(label="主办人重抽", custom_id="scrim:reroll")
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -285,7 +290,7 @@ class Scrims(commands.Cog):
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
-                body += "\n参赛者也可以在这里抽取本场被动。"
+                body += "\n参赛者可点击「查看我的分队」并抽取被动。"
             view = FinalScrimView(self, scrim, passives_ready)
         else:
             view = ScrimAnnouncement(self, scrim.stage == "signup")
@@ -441,31 +446,27 @@ class Scrims(commands.Cog):
             message = channel.get_partial_message(scrim.message_id)
             saved = await self.publish(scrim, updated, message)
             note = "" if saved else "公告更新失败，本次修改暂未保存，请重试。\n"
-        try:
-            await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
-        finally:
-            if saved and updated.stage == "confirmed":
-                await self.notify_teams(channel, updated)
+        await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
 
-    async def notify_teams(self, channel: discord.PartialMessageable, scrim: Scrim):
-        for user_id in scrim.players:
-            team = "A" if user_id in scrim.team_a else "B"
-            try:
-                await channel.send(
-                    f"<@{user_id}>，第 {scrim.number} 次趣味瓦内战的主办人 <@{scrim.host_id}> "
-                    f"已将你分配到 **{team} 队**。点击下方按钮抽取你的被动。",
-                    view=draw_view(scrim.message_id, user_id),
-                    allowed_mentions=discord.AllowedMentions(
-                        users=[discord.Object(id=user_id)], roles=False, everyone=False, replied_user=False,
-                    ),
-                )
-            except discord.HTTPException:
-                log.exception("Could not send scrim %s team assignment to %s", scrim.message_id, user_id)
+    async def show_my_team(self, interaction: discord.Interaction):
+        scrim = self.get_confirmed_scrim(interaction, interaction.message.id)
+        user_id = interaction.user.id
+        if scrim is None or user_id not in scrim.players:
+            await interaction.response.send_message("只有本场参赛者可以查看自己的分队。", ephemeral=True)
+            return
+        team = "A" if user_id in scrim.team_a else "B"
+        await interaction.response.send_message(
+            f"<@{user_id}>，第 {scrim.number} 次趣味瓦内战的主办人 <@{scrim.host_id}> "
+            f"已将你分配到 **{team} 队**。点击下方按钮抽取你的被动。",
+            view=draw_view(scrim.message_id, user_id),
+            ephemeral=True,
+            allowed_mentions=NO_PINGS,
+        )
 
     async def handle_draw(self, interaction: discord.Interaction, round_id: int, recipient_id: int):
         user_id = interaction.user.id
         if recipient_id and recipient_id != user_id:
-            await interaction.response.send_message("请使用你自己的通知或分队公告上的按钮。", ephemeral=True)
+            await interaction.response.send_message("请在分队公告上点击「查看我的分队」。", ephemeral=True)
             return
         if interaction.guild_id is None:
             await interaction.response.send_message("请在内战频道使用这个按钮。", ephemeral=True)
@@ -508,12 +509,12 @@ class Scrims(commands.Cog):
     async def publish_map_announcement(
         self, scrim: Scrim, map_name: str, results: dict[int, str],
     ) -> int:
-        _, image_path = VALORANT_MAPS[map_name]
+        image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
         map_card = discord.Embed(
             title=f"第 {scrim.number} 次趣味瓦内战 · 地图已确认",
             description=f"**{map_label(map_name)}**",
         )
-        map_card.set_image(url=f"{RIOT_MAP_IMAGE_BASE}{image_path}?w=1280&fit=max&fm=jpg")
+        map_card.set_image(url=f"attachment://{image_path.name}")
 
         guild = self.bot.get_guild(scrim.guild_id)
         team_rows: dict[str, list[str]] = {"A": [], "B": []}
@@ -535,12 +536,14 @@ class Scrims(commands.Cog):
         if scrim.map_announcement_id is not None:
             message = channel.get_partial_message(scrim.map_announcement_id)
             try:
-                await message.edit(embeds=embeds, allowed_mentions=NO_PINGS)
+                with closing(discord.File(image_path)) as image:
+                    await message.edit(embeds=embeds, attachments=[image], allowed_mentions=NO_PINGS)
             except discord.NotFound:
                 pass  # Recreate the announcement if it was deleted.
             else:
                 return scrim.map_announcement_id
-        message = await channel.send(embeds=embeds, allowed_mentions=NO_PINGS)
+        with closing(discord.File(image_path)) as image:
+            message = await channel.send(embeds=embeds, file=image, allowed_mentions=NO_PINGS)
         return message.id
 
     def get_confirmed_scrim(self, interaction: discord.Interaction, round_id: int) -> Scrim | None:
@@ -633,7 +636,7 @@ class Scrims(commands.Cog):
                     announcement_id = await self.publish_map_announcement(scrim, selected, results)
                 except discord.HTTPException:
                     log.exception("Could not publish map announcement for scrim %s", round_id)
-                    await interaction.edit_original_response(content="地图公告发布失败，请检查频道的发送消息和嵌入链接权限后重试。")
+                    await interaction.edit_original_response(content="地图公告发布失败，请检查频道的发送消息、嵌入链接和附加文件权限后重试。")
                     return
                 updated = replace(scrim, map_name=selected, map_announcement_id=announcement_id)
                 result = f"本场比赛地图为 **{map_label(selected)}**。"
