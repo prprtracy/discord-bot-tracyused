@@ -277,6 +277,7 @@ class Scrims(commands.Cog):
         self.bot = bot
         self.db = db
         self.guild_locks: dict[int, asyncio.Lock] = {}
+        self.signup_interactions: dict[tuple[int, int], discord.Interaction] = {}
 
     async def cog_load(self):
         # The message ID identifies the round, so one fallback view handles old announcements.
@@ -310,7 +311,7 @@ class Scrims(commands.Cog):
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
-                body += "\n请在机器人私信中抽取被动。未收到私信的参赛者可点击「查看我的分队」。"
+                body += "\n请在本频道仅自己可见的分队通知中抽取被动。未看到通知时，可点击「查看我的分队」。"
             view = FinalScrimView(self, scrim, passives_ready)
         else:
             view = ScrimAnnouncement(self, scrim.stage == "signup")
@@ -420,6 +421,7 @@ class Scrims(commands.Cog):
         async with self.lock_for(interaction.guild_id):
             scrim = self.db.get_scrim(interaction.guild_id, interaction.message.id)
             user = interaction.user
+            remember_signup = False
             if scrim is None:
                 result = "这场内战的记录已不可用。"
             elif not join:
@@ -429,6 +431,7 @@ class Scrims(commands.Cog):
                 result = "只有本场主办人可以打开管理面板。"
             elif user.id in scrim.players:
                 result = "你已在参赛名单中。"
+                remember_signup = scrim.stage != "confirmed"
             elif scrim.stage != "signup":
                 result = "本场报名已关闭。"
             else:
@@ -436,8 +439,14 @@ class Scrims(commands.Cog):
                 stage = "full" if len(players) == PLAYER_COUNT else "signup"
                 updated = replace(scrim, players=players, stage=stage, revision=scrim.revision + 1)
                 saved = await self.publish(scrim, updated, interaction.message)
+                remember_signup = saved
                 result = "报名成功！" if saved else "公告更新失败，报名暂未保存，请重试。"
-        await interaction.edit_original_response(content=result)
+            await interaction.edit_original_response(content=result)
+            if remember_signup:
+                for key, previous in list(self.signup_interactions.items()):
+                    if previous.is_expired():
+                        self.signup_interactions.pop(key)
+                self.signup_interactions[scrim.message_id, user.id] = interaction
 
     async def handle_host(
         self, snapshot: Scrim, action: str, interaction: discord.Interaction, values: tuple[int, ...] = (),
@@ -466,17 +475,22 @@ class Scrims(commands.Cog):
             message = channel.get_partial_message(scrim.message_id)
             saved = await self.publish(scrim, updated, message)
             note = "" if saved else "公告更新失败，本次修改暂未保存，请重试。\n"
+        await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
         if saved and updated.stage == "confirmed":
             failed = []
             for user_id in updated.players:
+                signup = self.signup_interactions.pop((updated.message_id, user_id), None)
+                target = interaction if user_id == updated.host_id else signup
+                if target is None or target.is_expired():
+                    failed.append(f"<@{user_id}>")
+                    continue
                 try:
-                    player = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-                    await player.send(**assignment_notice(updated, user_id))
+                    await target.followup.send(**assignment_notice(updated, user_id), ephemeral=True)
                 except discord.HTTPException:
                     failed.append(f"<@{user_id}>")
             if failed:
-                note = f"以下玩家未收到私信，可在公告点击「查看我的分队」：{'、'.join(failed)}。\n"
-        await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
+                note = f"以下玩家可在本频道公告点击「查看我的分队」领取通知：{'、'.join(failed)}。\n"
+                await interaction.edit_original_response(**self.panel(updated, note=note))
 
     async def show_my_team(self, interaction: discord.Interaction):
         scrim = self.get_confirmed_scrim(interaction, interaction.message.id)
