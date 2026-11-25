@@ -3,14 +3,17 @@ import logging
 from contextlib import closing
 from dataclasses import replace
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from random import choice
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from database import Database, Scrim
+from scrim_card import CardPlayer, render_matchup
 
 
 PLAYER_COUNT = 10
@@ -120,9 +123,14 @@ class FinalScrimView(discord.ui.View):
         self.cog = cog
         if scrim is None:
             return
+        if not scrim.passives_confirmed or not scrim.map_name or scrim.map_announcement_id is not None:
+            self.remove_item(self.match_found)
         if scrim.passives_confirmed:
             self.remove_item(self.reroll)
             self.remove_item(self.confirm_passives)
+            if scrim.map_announcement_id is not None:
+                self.remove_item(self.random_map)
+                self.remove_item(self.choose_map)
         else:
             self.remove_item(self.random_map)
             self.remove_item(self.choose_map)
@@ -148,6 +156,10 @@ class FinalScrimView(discord.ui.View):
     @discord.ui.button(label="手动选择地图", custom_id="scrim:choose-map")
     async def choose_map(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.handle_map_setup(interaction, interaction.message.id, "picker")
+
+    @discord.ui.button(label="Match Found", style=discord.ButtonStyle.success, custom_id="scrim:match-found")
+    async def match_found(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_map_setup(interaction, interaction.message.id, "match")
 
 
 class MapPicker(discord.ui.View):
@@ -293,6 +305,8 @@ class Scrims(commands.Cog):
             if scrim.passives_confirmed:
                 selected_map = map_label(scrim.map_name) if scrim.map_name else "待主办人选择"
                 body += f"\n被动已确认 · **比赛地图**　{selected_map}"
+                if scrim.map_name:
+                    body += "\n对战已确认。" if scrim.map_announcement_id else "\n地图已确认，等待主办人点击「Match Found」发布对战图。"
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
@@ -523,22 +537,44 @@ class Scrims(commands.Cog):
     ) -> int:
         image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
         map_card = discord.Embed(
-            title=f"第 {scrim.number} 次趣味瓦内战 · 地图已确认",
+            title=f"第 {scrim.number} 次趣味瓦内战 · Match Found",
             description=f"**{map_label(map_name)}**",
         )
-        map_card.set_image(url=f"attachment://{image_path.name}")
-
         guild = self.bot.get_guild(scrim.guild_id)
-        team_rows: dict[str, list[str]] = {"A": [], "B": []}
-        for user_id, saved_name in scrim.players.items():
+        async def load_player(user_id, saved_name):
             member = guild.get_member(user_id) if guild else None
-            nickname = member.display_name if member else saved_name
-            nickname = discord.utils.escape_mentions(discord.utils.escape_markdown(nickname))
+            try:
+                if guild and member is None:
+                    member = await asyncio.wait_for(guild.fetch_member(user_id), timeout=5)
+                avatar = None
+                if member:
+                    asset = member.display_avatar.replace(size=128, format="png")
+                    avatar = await asyncio.wait_for(asset.read(), timeout=5)
+            except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                avatar = None
+            return CardPlayer(member.display_name if member else saved_name, results[user_id], avatar)
+
+        players = await asyncio.gather(*(load_player(uid, name) for uid, name in scrim.players.items()))
+        card_teams = {"A": [], "B": []}
+        team_rows: dict[str, list[str]] = {"A": [], "B": []}
+        for user_id, player in zip(scrim.players, players):
+            nickname = discord.utils.escape_mentions(discord.utils.escape_markdown(player.name))
             if user_id == scrim.host_id:
                 nickname += "（主办人）"
             passive = discord.utils.escape_mentions(results[user_id])
             team = "A" if user_id in scrim.team_a else "B"
+            card_teams[team].append(player)
             team_rows[team].append(f"**{nickname}** · {passive}")
+        try:
+            background = MAP_IMAGE_DIR.with_name("scrim_backgrounds") / image_path.name
+            artwork = await asyncio.to_thread(render_matchup, background, map_name,
+                                              VALORANT_MAPS[map_name][0], scrim.number, card_teams)
+            filename = f"match-{scrim.number}-{image_path.name}"
+        except OSError:
+            log.exception("Matchup rendering failed for scrim %s", scrim.message_id)
+            artwork = image_path.read_bytes()
+            filename = image_path.name
+        map_card.set_image(url=f"attachment://{filename}")
         embeds = [map_card] + [
             discord.Embed(title=f"{team} 队", description="\n".join(rows) or "暂无成员")
             for team, rows in team_rows.items()
@@ -548,13 +584,13 @@ class Scrims(commands.Cog):
         if scrim.map_announcement_id is not None:
             message = channel.get_partial_message(scrim.map_announcement_id)
             try:
-                with closing(discord.File(image_path)) as image:
+                with closing(discord.File(BytesIO(artwork), filename=filename)) as image:
                     await message.edit(embeds=embeds, attachments=[image], allowed_mentions=NO_PINGS)
             except discord.NotFound:
                 pass  # Recreate the announcement if it was deleted.
             else:
                 return scrim.map_announcement_id
-        with closing(discord.File(image_path)) as image:
+        with closing(discord.File(BytesIO(artwork), filename=filename)) as image:
             message = await channel.send(embeds=embeds, file=image, allowed_mentions=NO_PINGS)
         return message.id
 
@@ -620,7 +656,10 @@ class Scrims(commands.Cog):
         async with self.lock_for(interaction.guild_id):
             scrim = self.get_confirmed_scrim(interaction, round_id)
             if scrim is None or interaction.user.id != scrim.host_id:
-                await interaction.edit_original_response(content="只有本场主办人可以确认被动或选图。")
+                await interaction.edit_original_response(content="只有本场主办人可以确认被动、选图或确认对战。")
+                return
+            if scrim.map_announcement_id is not None:
+                await interaction.edit_original_response(content="本场对战已经发布。")
                 return
             if action == "confirm":
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
@@ -635,30 +674,36 @@ class Scrims(commands.Cog):
             elif action == "picker":
                 await interaction.edit_original_response(content="请选择本场地图。", view=MapPicker(self, scrim))
                 return
-            else:
-                selected = choice(tuple(VALORANT_MAPS)) if action == "random" else map_name
-                if selected not in VALORANT_MAPS:
-                    await interaction.edit_original_response(content="请选择地图列表中的选项。")
+            elif action == "match":
+                if scrim.map_name not in VALORANT_MAPS:
+                    await interaction.edit_original_response(content="请先选择本场地图。")
                     return
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
                 if not passives_complete(scrim, results):
                     await interaction.edit_original_response(content="被动结果不完整，暂时无法发布地图公告。")
                     return
                 try:
-                    announcement_id = await self.publish_map_announcement(scrim, selected, results)
+                    announcement_id = await self.publish_map_announcement(scrim, scrim.map_name, results)
                 except discord.HTTPException:
                     log.exception("Could not publish map announcement for scrim %s", round_id)
                     await interaction.edit_original_response(content="地图公告发布失败，请检查频道的发送消息、嵌入链接和附加文件权限后重试。")
                     return
-                updated = replace(scrim, map_name=selected, map_announcement_id=announcement_id)
-                result = f"本场比赛地图为 **{map_label(selected)}**。"
+                updated = replace(scrim, map_announcement_id=announcement_id)
+                result = "对战已确认，对战公告已发布。"
+            else:
+                selected = choice(tuple(VALORANT_MAPS)) if action == "random" else map_name
+                if selected not in VALORANT_MAPS:
+                    await interaction.edit_original_response(content="请选择地图列表中的选项。")
+                    return
+                updated = replace(scrim, map_name=selected)
+                result = f"地图已确认：**{map_label(selected)}**。点击内战公告上的「Match Found」发布对战图。"
             self.db.save_scrim(updated)
             if not await self.publish_passive_table(updated):
-                if action == "confirm":
+                if action != "match":
                     self.db.save_scrim(scrim)
                     result = "公告更新失败，操作暂未保存，请重试。"
                 else:
-                    result += "\n地图公告已发布，原报名公告刷新失败。重新选图可以重试刷新。"
+                    result += "\n原报名公告刷新失败，对战公告仍可在频道中查看。"
         await interaction.edit_original_response(content=result)
 
     @staticmethod
