@@ -82,30 +82,36 @@ class ScrimAnnouncement(discord.ui.View):
         await self.cog.handle_public(interaction, join=False)
 
 
-class PassiveDraw(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:passive:(?P<round_id>\d+):(?P<recipient_id>\d+)"):
-    def __init__(self, round_id: int, recipient_id: int = 0):
+class PassiveDraw(discord.ui.DynamicItem[discord.ui.Button], template=r"scrim:passive:(?P<round_id>\d+):(?P<recipient_id>\d+)(?::(?P<guild_id>\d+))?"):
+    def __init__(self, round_id: int, recipient_id: int = 0, guild_id: int | None = None):
         self.round_id = round_id
         self.recipient_id = recipient_id
+        self.guild_id = guild_id
+        custom_id = f"scrim:passive:{round_id}:{recipient_id}"
+        if guild_id is not None:
+            custom_id += f":{guild_id}"
         super().__init__(discord.ui.Button(
             label="抽取被动",
             style=discord.ButtonStyle.primary,
-            custom_id=f"scrim:passive:{round_id}:{recipient_id}",
+            custom_id=custom_id,
         ))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        return cls(int(match["round_id"]), int(match["recipient_id"]))
+        return cls(int(match["round_id"]), int(match["recipient_id"]), int(match["guild_id"]) if match["guild_id"] else None)
 
     async def callback(self, interaction: discord.Interaction):
         cog = interaction.client.get_cog("Scrims")
         if cog is not None:
-            await cog.handle_draw(interaction, self.round_id, self.recipient_id)
+            await cog.handle_draw(interaction, self.round_id, self.recipient_id, self.guild_id)
 
 
-def draw_view(round_id: int, recipient_id: int) -> discord.ui.View:
+def assignment_notice(scrim: Scrim, user_id: int) -> dict:
     view = discord.ui.View(timeout=None)
-    view.add_item(PassiveDraw(round_id, recipient_id))
-    return view
+    view.add_item(PassiveDraw(scrim.message_id, user_id, scrim.guild_id))
+    team = "A" if user_id in scrim.team_a else "B"
+    return dict(content=f"第 {scrim.number} 次趣味瓦内战的主办人 <@{scrim.host_id}> 已将你分配到 **{team} 队**。点击下方按钮抽取你的被动。",
+                view=view, allowed_mentions=NO_PINGS)
 
 
 class FinalScrimView(discord.ui.View):
@@ -290,7 +296,7 @@ class Scrims(commands.Cog):
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
-                body += "\n参赛者可点击「查看我的分队」并抽取被动。"
+                body += "\n请在机器人私信中抽取被动。未收到私信的参赛者可点击「查看我的分队」。"
             view = FinalScrimView(self, scrim, passives_ready)
         else:
             view = ScrimAnnouncement(self, scrim.stage == "signup")
@@ -446,6 +452,16 @@ class Scrims(commands.Cog):
             message = channel.get_partial_message(scrim.message_id)
             saved = await self.publish(scrim, updated, message)
             note = "" if saved else "公告更新失败，本次修改暂未保存，请重试。\n"
+        if saved and updated.stage == "confirmed":
+            failed = []
+            for user_id in updated.players:
+                try:
+                    player = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                    await player.send(**assignment_notice(updated, user_id))
+                except discord.HTTPException:
+                    failed.append(f"<@{user_id}>")
+            if failed:
+                note = f"以下玩家未收到私信，可在公告点击「查看我的分队」：{'、'.join(failed)}。\n"
         await interaction.edit_original_response(**self.panel(updated if saved else scrim, note=note))
 
     async def show_my_team(self, interaction: discord.Interaction):
@@ -454,27 +470,23 @@ class Scrims(commands.Cog):
         if scrim is None or user_id not in scrim.players:
             await interaction.response.send_message("只有本场参赛者可以查看自己的分队。", ephemeral=True)
             return
-        team = "A" if user_id in scrim.team_a else "B"
         await interaction.response.send_message(
-            f"<@{user_id}>，第 {scrim.number} 次趣味瓦内战的主办人 <@{scrim.host_id}> "
-            f"已将你分配到 **{team} 队**。点击下方按钮抽取你的被动。",
-            view=draw_view(scrim.message_id, user_id),
-            ephemeral=True,
-            allowed_mentions=NO_PINGS,
+            **assignment_notice(scrim, user_id), ephemeral=True,
         )
 
-    async def handle_draw(self, interaction: discord.Interaction, round_id: int, recipient_id: int):
+    async def handle_draw(self, interaction: discord.Interaction, round_id: int, recipient_id: int, source_guild_id: int | None = None):
         user_id = interaction.user.id
         if recipient_id and recipient_id != user_id:
             await interaction.response.send_message("请在分队公告上点击「查看我的分队」。", ephemeral=True)
             return
-        if interaction.guild_id is None:
+        guild_id = interaction.guild_id or source_guild_id
+        if guild_id is None or (interaction.guild_id is None and not recipient_id):
             await interaction.response.send_message("请在内战频道使用这个按钮。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        async with self.lock_for(interaction.guild_id):
-            scrim = self.get_confirmed_scrim(interaction, round_id)
-            if scrim is None:
+        async with self.lock_for(guild_id):
+            scrim = self.db.get_scrim(guild_id, round_id)
+            if scrim is None or scrim.stage != "confirmed" or (interaction.guild_id and interaction.channel_id != scrim.channel_id):
                 result = "这场内战的抽取暂不可用。"
             elif user_id not in scrim.players:
                 result = "只有本场参赛者可以抽取被动。"
