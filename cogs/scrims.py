@@ -248,6 +248,7 @@ class HostPanel(discord.ui.View):
                 self.add_map_button("开始比赛", "match", discord.ButtonStyle.success)
         elif scrim.stage == "confirmed":
             self.add_map_button("修改地图", "picker", discord.ButtonStyle.secondary)
+            self.add_map_button("结束对战", "end", discord.ButtonStyle.danger)
 
     def add_map_button(self, label: str, action: str, style: discord.ButtonStyle):
         button = discord.ui.Button(label=label, style=style)
@@ -319,7 +320,10 @@ class Scrims(commands.Cog):
                 selected_map = map_label(scrim.map_name) if scrim.map_name else "待主办人选择"
                 body += f"\n被动已确认 · **比赛地图**　{selected_map}"
                 if scrim.map_name:
-                    body += "\n对战已确认。" if scrim.map_announcement_id else "\n地图已确认，等待主办人开始比赛。"
+                    if scrim.ended:
+                        body += "\n对战已结束。"
+                    else:
+                        body += "\n对战已确认。" if scrim.map_announcement_id else "\n地图已确认，等待主办人开始比赛。"
             elif passives_ready:
                 body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
@@ -348,7 +352,7 @@ class Scrims(commands.Cog):
             body = teams_text(scrim) if scrim.team_a else roster_text(scrim)
         return {
             "content": f"**第 {scrim.number} 次趣味瓦内战 · 主办人面板**\n{note}{body}",
-            "view": HostPanel(self, scrim, mode),
+            "view": None if scrim.ended else HostPanel(self, scrim, mode),
             "allowed_mentions": NO_PINGS,
         }
 
@@ -402,8 +406,12 @@ class Scrims(commands.Cog):
                 await interaction.edit_original_response(content="请让服务器管理员先使用 /设置内战频道。")
                 return
             host = interaction.user
+            origin = host.voice.channel if host.voice else None
+            if origin is None:
+                await interaction.edit_original_response(content="请先加入赛后集合用的语音频道，再输入 /趣味内战。")
+                return
             scrim = Scrim(guild_id, self.db.next_scrim_number(guild_id), channel.id, 0,
-                          host.id, {host.id: host.display_name})
+                          host.id, {host.id: host.display_name}, origin_voice_id=origin.id)
             try:
                 message = await channel.send(**self.announcement(scrim))
             except discord.HTTPException:
@@ -433,7 +441,7 @@ class Scrims(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         async with self.lock_for(interaction.guild_id):
             scrim = self.db.get_host_scrim(interaction.guild_id, interaction.user.id, number)
-            if not scrim:
+            if not scrim or scrim.ended:
                 await interaction.edit_original_response(content="没有可管理的对应场次。")
                 return
             await interaction.edit_original_response(**self.panel(scrim))
@@ -594,6 +602,7 @@ class Scrims(commands.Cog):
     async def ensure_team_voice_channels(self, guild: discord.Guild, scrim: Scrim):
         lobby = guild.get_channel(scrim.channel_id) or await guild.fetch_channel(scrim.channel_id)
         existing = self.db.get_scrim_voice_channels(scrim.message_id)
+        channels = {}
         for team in ("A", "B"):
             if team in existing:
                 try:
@@ -602,11 +611,32 @@ class Scrims(commands.Cog):
                     pass
                 else:
                     if isinstance(channel, discord.VoiceChannel):
+                        channels[team] = channel
                         continue
             channel = await guild.create_voice_channel(
                 f"内战{team}队", category=lobby.category, reason=f"第 {scrim.number} 次趣味瓦内战",
             )
             self.db.save_scrim_voice_channel(scrim.message_id, team, channel.id)
+            channels[team] = channel
+        return channels
+
+    async def return_voice_members(self, guild: discord.Guild, scrim: Scrim) -> str:
+        origin = guild.get_channel(scrim.origin_voice_id) if scrim.origin_voice_id else None
+        for channel_id in self.db.get_scrim_voice_channels(scrim.message_id).values():
+            try:
+                room = await guild.fetch_channel(channel_id)
+            except discord.NotFound:
+                continue
+            if not isinstance(room, discord.VoiceChannel):
+                continue
+            for member in list(room.members):
+                if member.id not in scrim.players:
+                    return "队伍频道里还有非参赛成员，请等其离开，再点「结束对战」。"
+                if origin is None:
+                    return "原集合频道不可用，请先让队员离开队伍频道，再点「结束对战」清理空频道。"
+                await member.move_to(origin, reason=f"第 {scrim.number} 场内战结束")
+            await room.delete(reason=f"第 {scrim.number} 场内战结束")
+        return ""
 
     async def publish_map_announcement(
         self, scrim: Scrim, map_name: str, results: dict[int, str],
@@ -735,10 +765,27 @@ class Scrims(commands.Cog):
             if scrim is None or scrim.stage != "confirmed" or interaction.user.id != scrim.host_id:
                 await interaction.edit_original_response(content="只有本场主办人可以确认被动、选图或确认对战。")
                 return
-            if scrim.map_announcement_id is not None and action not in ("picker", "replace_map"):
+            if scrim.ended:
+                await interaction.edit_original_response(content="本场对战已结束。", view=None)
+                return
+            if scrim.map_announcement_id is not None and action not in ("picker", "replace_map", "end"):
                 await interaction.edit_original_response(**self.panel(scrim, note="本场对战已经发布。\n"))
                 return
-            if action == "confirm":
+            if action == "end":
+                if scrim.map_announcement_id is None:
+                    await interaction.edit_original_response(content="本场对战尚未开始。")
+                    return
+                try:
+                    issue = await self.return_voice_members(interaction.guild, scrim)
+                except discord.HTTPException:
+                    log.exception("Could not finish voice cleanup for scrim %s", round_id)
+                    issue = "语音归队或清理失败。请检查「移动成员」「连接」「管理频道」权限及集合频道容量，再点「结束对战」。"
+                if issue:
+                    await interaction.edit_original_response(**self.panel(scrim, note=issue + "\n"))
+                    return
+                updated = replace(scrim, ended=True)
+                result = "对战已结束，本场队伍语音频道已清理。"
+            elif action == "confirm":
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
                 if not passives_complete(scrim, results):
                     await interaction.edit_original_response(content="请等所有参赛者抽完各自的被动。")
@@ -762,12 +809,22 @@ class Scrims(commands.Cog):
                     await interaction.edit_original_response(content="被动结果不完整，暂时无法发布地图公告。")
                     return
                 if action == "match":
+                    offline = []
                     try:
-                        await self.ensure_team_voice_channels(interaction.guild, scrim)
+                        channels = await self.ensure_team_voice_channels(interaction.guild, scrim)
+                        if scrim.origin_voice_id:
+                            for uid in scrim.players:
+                                member = interaction.guild.get_member(uid)
+                                if not member or not member.voice or not member.voice.channel:
+                                    offline.append(f"<@{uid}>")
+                                    continue
+                                room = channels["A" if uid in scrim.team_a else "B"]
+                                if member.voice.channel.id != room.id:
+                                    await member.move_to(room, reason=f"第 {scrim.number} 场内战开始")
                     except discord.HTTPException:
                         log.exception("Could not prepare team voice channels for scrim %s", round_id)
                         await interaction.edit_original_response(**self.panel(
-                            scrim, note="语音频道尚未准备好。请检查机器人的「管理频道」权限和分类容量，再点「开始比赛」重试。\n",
+                            scrim, note="语音分队尚未完成。请检查「管理频道」「移动成员」「连接」权限及频道容量，再点「开始比赛」重试。\n",
                         ))
                         return
                 try:
@@ -778,6 +835,8 @@ class Scrims(commands.Cog):
                     return
                 updated = replace(scrim, map_name=selected, map_announcement_id=announcement_id)
                 result = "对战图已按新地图更新。" if action == "replace_map" else "对战已确认，对战公告已发布。"
+                if action == "match" and offline:
+                    result += "\n未连接语音，请自行加入队伍频道：" + "、".join(offline)
             else:
                 selected = choice(tuple(VALORANT_MAPS)) if action == "random" else map_name
                 if selected not in VALORANT_MAPS:

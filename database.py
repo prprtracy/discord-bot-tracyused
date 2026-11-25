@@ -82,6 +82,8 @@ class Scrim:
     passives_confirmed: bool = False
     map_name: str | None = None
     map_announcement_id: int | None = None
+    origin_voice_id: int | None = None
+    ended: bool = False
 
 
 class Database:
@@ -121,6 +123,10 @@ class Database:
                 )
             """)
             scrim_columns = {row[1] for row in conn.execute("PRAGMA table_info(scrims)")}
+            if "origin_voice_id" not in scrim_columns:
+                conn.execute("ALTER TABLE scrims ADD COLUMN origin_voice_id INTEGER")
+            if "ended" not in scrim_columns:
+                conn.execute("ALTER TABLE scrims ADD COLUMN ended INTEGER NOT NULL DEFAULT 0")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scrim_voice_channels (
                     message_id INTEGER NOT NULL,
@@ -252,7 +258,7 @@ class Database:
         with closing(self._conn()) as conn:
             row = conn.execute("""
                 SELECT guild_id, number, channel_id, message_id, host_id,
-                       players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id
+                       players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id, origin_voice_id, ended
                 FROM scrims WHERE guild_id = ? AND message_id = ?
             """, (guild_id, message_id)).fetchone()
         if row is None:
@@ -265,8 +271,8 @@ class Database:
             conn.execute("""
                 INSERT INTO scrims
                     (guild_id, number, channel_id, message_id, host_id,
-                     players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     players, stage, team_a, revision, passives_confirmed, map_name, map_announcement_id, origin_voice_id, ended)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id, message_id) DO UPDATE SET
                     players = excluded.players,
                     stage = excluded.stage,
@@ -274,12 +280,14 @@ class Database:
                     revision = excluded.revision,
                     passives_confirmed = excluded.passives_confirmed,
                     map_name = excluded.map_name,
-                    map_announcement_id = excluded.map_announcement_id
+                    map_announcement_id = excluded.map_announcement_id,
+                    origin_voice_id = excluded.origin_voice_id,
+                    ended = excluded.ended
             """, (
                 scrim.guild_id, scrim.number, scrim.channel_id, scrim.message_id,
                 scrim.host_id, json.dumps(scrim.players), scrim.stage,
                 json.dumps(scrim.team_a), scrim.revision, scrim.passives_confirmed, scrim.map_name,
-                scrim.map_announcement_id,
+                scrim.map_announcement_id, scrim.origin_voice_id, scrim.ended,
             ))
 
     def get_scrim_voice_channels(self, message_id: int) -> dict[str, int]:
