@@ -12,7 +12,6 @@ from database import Database, Scrim
 
 
 PLAYER_COUNT = 10
-TEAM_SIZE = PLAYER_COUNT // 2
 # Riot's map catalog: https://playvalorant.com/en-us/maps/
 # Summit uses the official 13.00 patch artwork shown in the announcement preview.
 VALORANT_MAPS = {
@@ -40,10 +39,14 @@ def map_label(name: str) -> str:
     return f"{name}（{localized_name}）"
 
 
+def team_a_size(scrim: Scrim) -> int:
+    return (len(scrim.players) + 1) // 2
+
+
 def teams_text(scrim: Scrim) -> str:
     team_a = ", ".join(f"<@{user_id}>" for user_id in scrim.team_a)
     team_b = ", ".join(f"<@{user_id}>" for user_id in scrim.players if user_id not in scrim.team_a)
-    return f"**A 队**　{team_a}\n**B 队**　{team_b}"
+    return f"**A 队**　{team_a}\n**B 队**　{team_b or '暂无成员'}"
 
 
 def roster_text(scrim: Scrim) -> str:
@@ -55,9 +58,9 @@ def roster_text(scrim: Scrim) -> str:
 
 def passives_complete(scrim: Scrim, results: dict[int, str]) -> bool:
     return (
-        len(scrim.players) == PLAYER_COUNT
+        bool(scrim.players)
         and scrim.players.keys() <= results.keys()
-        and len({results[user_id] for user_id in scrim.players}) == PLAYER_COUNT
+        and len({results[user_id] for user_id in scrim.players}) == len(scrim.players)
     )
 
 
@@ -202,20 +205,20 @@ class HostPanel(discord.ui.View):
         super().__init__(timeout=900)
         self.cog = cog
         self.scrim = scrim
+        a_size = team_a_size(scrim)
         if mode == "remove":
             self.add_picker("删除用户", "remove", 1)
         elif mode == "pick":
-            self.add_picker("选择 A 队的 5 名成员", "pick", TEAM_SIZE)
+            self.add_picker(f"选择 A 队的 {a_size} 名成员", "pick", a_size)
         elif scrim.stage in ("signup", "full"):
             if len(scrim.players) > 1:
                 self.add_button("删除用户", "show_remove", discord.ButtonStyle.danger)
-            if scrim.stage == "full":
-                self.add_button("确认列表，开始分队", "start", discord.ButtonStyle.success)
+            self.add_button("确认列表，开始分队", "start", discord.ButtonStyle.success)
         elif scrim.stage == "teams" and scrim.team_a:
             self.add_button("确认分队", "confirm", discord.ButtonStyle.success)
             self.add_button("修改分队", "show_pick", discord.ButtonStyle.secondary)
         elif scrim.stage == "teams":
-            self.add_picker("选择 A 队的 5 名成员", "pick", TEAM_SIZE)
+            self.add_picker(f"选择 A 队的 {a_size} 名成员", "pick", a_size)
 
     def add_button(self, label: str, action: str, style: discord.ButtonStyle):
         button = discord.ui.Button(label=label, style=style)
@@ -280,7 +283,7 @@ class Scrims(commands.Cog):
                 selected_map = map_label(scrim.map_name) if scrim.map_name else "待主办人选择"
                 body += f"\n被动已确认 · **比赛地图**　{selected_map}"
             elif passives_ready:
-                body += "\n10 位玩家已抽完被动，等待主办人确认。"
+                body += f"\n{len(scrim.players)} 位玩家已抽完被动，等待主办人确认。"
             else:
                 body += "\n参赛者也可以在这里抽取本场被动。"
             view = FinalScrimView(self, scrim, passives_ready)
@@ -296,7 +299,9 @@ class Scrims(commands.Cog):
         if mode == "remove":
             body = "选择要移除的成员。空出的名额会重新开放报名。"
         elif mode == "pick" or (scrim.stage == "teams" and not scrim.team_a):
-            body = "请选择 A 队的 5 名成员，其余 5 人自动进入 B 队。"
+            a_size = team_a_size(scrim)
+            b_size = len(scrim.players) - a_size
+            body = f"请选择 A 队的 {a_size} 名成员，其余 {b_size} 人自动进入 B 队。"
         elif scrim.stage == "confirmed":
             body = "分队已确认。\n" + teams_text(scrim)
         else:
@@ -345,7 +350,7 @@ class Scrims(commands.Cog):
         for page in pages[1:]:
             await interaction.followup.send(page, ephemeral=True, allowed_mentions=NO_PINGS)
 
-    @app_commands.command(name="趣味内战", description="发起一场 10 人 VALORANT 趣味内战")
+    @app_commands.command(name="趣味内战", description="发起一场最多 10 人的 VALORANT 趣味内战")
     @app_commands.guild_only()
     async def start_scrim(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -522,7 +527,7 @@ class Scrims(commands.Cog):
             team = "A" if user_id in scrim.team_a else "B"
             team_rows[team].append(f"**{nickname}** · {passive}")
         embeds = [map_card] + [
-            discord.Embed(title=f"{team} 队", description="\n".join(rows))
+            discord.Embed(title=f"{team} 队", description="\n".join(rows) or "暂无成员")
             for team, rows in team_rows.items()
         ]
 
@@ -605,7 +610,7 @@ class Scrims(commands.Cog):
             if action == "confirm":
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
                 if not passives_complete(scrim, results):
-                    await interaction.edit_original_response(content="请等 10 名玩家抽完各自的被动。")
+                    await interaction.edit_original_response(content="请等所有参赛者抽完各自的被动。")
                     return
                 updated = replace(scrim, passives_confirmed=True)
                 result = "已确认被动。现在可以抽取地图或手动选择地图。"
@@ -649,11 +654,11 @@ class Scrims(commands.Cog):
             if user_id in scrim.players and user_id != scrim.host_id:
                 players = {uid: name for uid, name in scrim.players.items() if uid != user_id}
                 return replace(scrim, players=players, stage="signup", revision=revision)
-        if action == "start" and scrim.stage == "full" and len(scrim.players) == PLAYER_COUNT:
+        if action == "start" and scrim.stage in ("signup", "full") and scrim.players:
             return replace(scrim, stage="teams", revision=revision)
         if action == "pick" and scrim.stage == "teams":
             selected = set(values)
-            if len(values) == len(selected) == TEAM_SIZE and selected.issubset(scrim.players):
+            if len(values) == len(selected) == team_a_size(scrim) and selected.issubset(scrim.players):
                 return replace(scrim, team_a=values, revision=revision)
         if action == "confirm" and scrim.stage == "teams" and scrim.team_a:
             return replace(scrim, stage="confirmed", revision=revision)
