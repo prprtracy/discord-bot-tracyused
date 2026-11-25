@@ -930,6 +930,16 @@ class Scrims(commands.Cog):
                 else:
                     result += "\n原报名公告刷新失败，对战公告仍可在频道中查看。"
         panel_state = updated if published or updated.map_announcement_id is not None else scrim
+        if action == "confirm" and published:
+            await interaction.edit_original_response(content="被动已确认。", view=None)
+            try:
+                await interaction.followup.send(
+                    f"第 {updated.number} 次趣味瓦内战 · 请选择比赛地图。",
+                    view=HostPanel(self, updated), ephemeral=True, allowed_mentions=NO_PINGS,
+                )
+            except discord.HTTPException:
+                await interaction.edit_original_response(**self.panel(updated, note=result + "\n"))
+            return
         await interaction.edit_original_response(**self.panel(panel_state, note=result + "\n"))
         if action == "match":
             await self.send_end_button(interaction, updated)
