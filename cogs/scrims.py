@@ -309,7 +309,7 @@ class Scrims(commands.Cog):
         self.bot = bot
         self.db = db
         self.guild_locks: dict[int, asyncio.Lock] = {}
-        self.signup_interactions: dict[tuple[int, int], discord.Interaction] = {}
+        self.player_interactions: dict[tuple[int, int], discord.Interaction] = {}
         self.host_panels: dict[int, discord.Interaction] = {}
 
     async def cog_load(self):
@@ -523,10 +523,15 @@ class Scrims(commands.Cog):
                 result = "报名成功！" if saved else "公告更新失败，报名暂未保存，请重试。"
             await interaction.edit_original_response(content=result)
             if remember_signup:
-                for key, previous in list(self.signup_interactions.items()):
-                    if previous.is_expired():
-                        self.signup_interactions.pop(key)
-                self.signup_interactions[scrim.message_id, user.id] = interaction
+                self.remember_player_interaction(scrim, interaction)
+
+    def remember_player_interaction(self, scrim: Scrim, interaction: discord.Interaction):
+        if interaction.guild_id != scrim.guild_id or interaction.channel_id != scrim.channel_id:
+            return
+        for key, previous in list(self.player_interactions.items()):
+            if previous.is_expired():
+                self.player_interactions.pop(key)
+        self.player_interactions[scrim.message_id, interaction.user.id] = interaction
 
     async def handle_host(
         self, snapshot: Scrim, action: str, interaction: discord.Interaction, values: tuple[int, ...] = (),
@@ -565,7 +570,7 @@ class Scrims(commands.Cog):
             self.host_panels.pop(updated.message_id, None)
             failed = []
             for user_id in updated.players:
-                signup = self.signup_interactions.pop((updated.message_id, user_id), None)
+                signup = self.player_interactions.get((updated.message_id, user_id))
                 target = interaction if user_id == updated.host_id else signup
                 if target is None or target.is_expired() or target.channel_id != updated.channel_id:
                     failed.append(f"<@{user_id}>")
@@ -584,9 +589,14 @@ class Scrims(commands.Cog):
         if scrim is None or user_id not in scrim.players:
             await interaction.response.send_message("只有本场参赛者可以查看自己的分队。", ephemeral=True)
             return
-        await interaction.response.send_message(
-            **assignment_notice(scrim, user_id), ephemeral=True,
-        )
+        self.remember_player_interaction(scrim, interaction)
+        current = self.db.get_scrim_passive_results(scrim.guild_id, scrim.message_id).get(user_id)
+        if current:
+            team = "A" if user_id in scrim.team_a else "B"
+            await interaction.response.send_message(f"你在 {team} 队，当前被动是：{current}",
+                                                    ephemeral=True, allowed_mentions=NO_PINGS)
+        else:
+            await interaction.response.send_message(**assignment_notice(scrim, user_id), ephemeral=True)
 
     async def handle_draw(self, interaction: discord.Interaction, round_id: int, recipient_id: int, source_guild_id: int | None = None):
         user_id = interaction.user.id
@@ -605,6 +615,7 @@ class Scrims(commands.Cog):
             elif user_id not in scrim.players:
                 result = "只有本场参赛者可以抽取被动。"
             else:
+                self.remember_player_interaction(scrim, interaction)
                 passive = self.db.draw_scrim_passive(scrim.guild_id, scrim.message_id, user_id)
                 if passive is None:
                     result = "暂无可用的被动，请管理员通过 /添加内战被动 补充条目。"
@@ -787,6 +798,19 @@ class Scrims(commands.Cog):
                     result = "没有空闲的被动可以重抽，请先通过 /添加内战被动 补充条目。"
                 else:
                     result = f"已为 <@{user_id}> 重抽。新被动是：{passive}"
+                    if user_id != interaction.user.id:
+                        target = self.player_interactions.get((round_id, user_id))
+                        delivered = False
+                        if target and not target.is_expired():
+                            try:
+                                await target.followup.send(
+                                    f"第 {scrim.number} 次趣味瓦内战 · 主办人已为你重抽。\n你的新被动是：**{passive}**",
+                                    ephemeral=True, allowed_mentions=NO_PINGS,
+                                )
+                                delivered = True
+                            except discord.HTTPException:
+                                log.info("Could not deliver private reroll for scrim %s", round_id)
+                        result += "\n已在内战频道通知该玩家。" if delivered else "\n未能自动通知。该玩家可点击「查看我的分队」查看最新被动。"
                     if not await self.publish_passive_table(scrim):
                         result += "\n公开表格更新失败。参赛者再次点击「抽取被动」即可重试更新。"
         await interaction.edit_original_response(content=result, allowed_mentions=NO_PINGS)
