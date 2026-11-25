@@ -168,7 +168,8 @@ class MapPicker(discord.ui.View):
         )
 
         async def select(interaction: discord.Interaction):
-            await cog.handle_map_setup(interaction, scrim.message_id, "select", picker.values[0])
+            action = "replace_map" if scrim.map_announcement_id is not None else "select"
+            await cog.handle_map_setup(interaction, scrim.message_id, action, picker.values[0])
 
         picker.callback = select
         self.add_item(picker)
@@ -242,9 +243,11 @@ class HostPanel(discord.ui.View):
             self.add_map_button("确认被动", "confirm", discord.ButtonStyle.success)
         elif scrim.stage == "confirmed" and scrim.map_announcement_id is None:
             self.add_map_button("抽取地图", "random", discord.ButtonStyle.primary)
-            self.add_map_button("手动选择地图", "picker", discord.ButtonStyle.secondary)
+            self.add_map_button("修改地图" if scrim.map_name else "手动选择地图", "picker", discord.ButtonStyle.secondary)
             if scrim.map_name:
                 self.add_map_button("开始比赛", "match", discord.ButtonStyle.success)
+        elif scrim.stage == "confirmed":
+            self.add_map_button("修改地图", "picker", discord.ButtonStyle.secondary)
 
     def add_map_button(self, label: str, action: str, style: discord.ButtonStyle):
         button = discord.ui.Button(label=label, style=style)
@@ -345,7 +348,7 @@ class Scrims(commands.Cog):
             body = teams_text(scrim) if scrim.team_a else roster_text(scrim)
         return {
             "content": f"**第 {scrim.number} 次趣味瓦内战 · 主办人面板**\n{note}{body}",
-            "view": None if scrim.map_announcement_id is not None else HostPanel(self, scrim, mode),
+            "view": HostPanel(self, scrim, mode),
             "allowed_mentions": NO_PINGS,
         }
 
@@ -430,7 +433,7 @@ class Scrims(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         async with self.lock_for(interaction.guild_id):
             scrim = self.db.get_host_scrim(interaction.guild_id, interaction.user.id, number)
-            if not scrim or scrim.map_announcement_id is not None:
+            if not scrim:
                 await interaction.edit_original_response(content="没有可管理的对应场次。")
                 return
             await interaction.edit_original_response(**self.panel(scrim))
@@ -715,8 +718,8 @@ class Scrims(commands.Cog):
             if scrim is None or scrim.stage != "confirmed" or interaction.user.id != scrim.host_id:
                 await interaction.edit_original_response(content="只有本场主办人可以确认被动、选图或确认对战。")
                 return
-            if scrim.map_announcement_id is not None:
-                await interaction.edit_original_response(content="本场对战已经发布。")
+            if scrim.map_announcement_id is not None and action not in ("picker", "replace_map"):
+                await interaction.edit_original_response(**self.panel(scrim, note="本场对战已经发布。\n"))
                 return
             if action == "confirm":
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
@@ -729,10 +732,12 @@ class Scrims(commands.Cog):
                 await interaction.edit_original_response(content="请先确认本场被动。")
                 return
             elif action == "picker":
-                await interaction.edit_original_response(content="请选择本场地图。", view=MapPicker(self, scrim))
+                prompt = "选择新地图后，机器人会更新已发布的对战图。" if scrim.map_announcement_id else "请选择本场地图。"
+                await interaction.edit_original_response(content=prompt, view=MapPicker(self, scrim))
                 return
-            elif action == "match":
-                if scrim.map_name not in VALORANT_MAPS:
+            elif action in ("match", "replace_map"):
+                selected = map_name if action == "replace_map" else scrim.map_name
+                if selected not in VALORANT_MAPS or (action == "replace_map" and scrim.map_announcement_id is None):
                     await interaction.edit_original_response(content="请先选择本场地图。")
                     return
                 results = self.db.get_scrim_passive_results(scrim.guild_id, round_id)
@@ -740,13 +745,13 @@ class Scrims(commands.Cog):
                     await interaction.edit_original_response(content="被动结果不完整，暂时无法发布地图公告。")
                     return
                 try:
-                    announcement_id = await self.publish_map_announcement(scrim, scrim.map_name, results)
+                    announcement_id = await self.publish_map_announcement(scrim, selected, results)
                 except discord.HTTPException:
                     log.exception("Could not publish map announcement for scrim %s", round_id)
                     await interaction.edit_original_response(content="地图公告发布失败，请检查频道的发送消息、嵌入链接和附加文件权限后重试。")
                     return
-                updated = replace(scrim, map_announcement_id=announcement_id)
-                result = "对战已确认，对战公告已发布。"
+                updated = replace(scrim, map_name=selected, map_announcement_id=announcement_id)
+                result = "对战图已按新地图更新。" if action == "replace_map" else "对战已确认，对战公告已发布。"
             else:
                 selected = choice(tuple(VALORANT_MAPS)) if action == "random" else map_name
                 if selected not in VALORANT_MAPS:
@@ -757,12 +762,12 @@ class Scrims(commands.Cog):
             self.db.save_scrim(updated)
             published = await self.publish_passive_table(updated)
             if not published:
-                if action != "match":
+                if updated.map_announcement_id is None:
                     self.db.save_scrim(scrim)
                     result = "公告更新失败，操作暂未保存，请重试。"
                 else:
                     result += "\n原报名公告刷新失败，对战公告仍可在频道中查看。"
-        panel_state = updated if published or action == "match" else scrim
+        panel_state = updated if published or updated.map_announcement_id is not None else scrim
         await interaction.edit_original_response(**self.panel(panel_state, note=result + "\n"))
 
     @staticmethod
