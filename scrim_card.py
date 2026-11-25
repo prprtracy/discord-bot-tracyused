@@ -40,6 +40,38 @@ def lines_for(text, face, width, limit):
     return lines
 
 
+def render_victory(team: str, players: list[CardPlayer]) -> bytes:
+    with Image.open(Path(__file__).resolve().parent / "assets" / "victory.jpg") as background:
+        canvas = background.convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((800, 359), f"{team} 队获胜", font=font(40, True), anchor="mm", fill="#fff5dc")
+    diameter = 210
+    mask = Image.new("L", (diameter, diameter))
+    ImageDraw.Draw(mask).ellipse((0, 0, diameter-1, diameter-1), fill=255)
+    for index, player in enumerate(players):
+        x = 800 + (2*index + 1 - len(players))*145
+        y = 445
+        draw.ellipse((x-110, y-5, x+110, y+215), fill="#82efda")
+        tile = None
+        if player.avatar:
+            try:
+                with Image.open(BytesIO(player.avatar)) as src:
+                    tile = ImageOps.fit(src.convert("RGB"), mask.size, method=Image.Resampling.LANCZOS)
+            except OSError:
+                pass
+        if tile is None:
+            tile = Image.new("RGB", mask.size, "#10474b")
+            ImageDraw.Draw(tile).text((105, 105), player.name[:1], font=font(78, True), anchor="mm", fill="white")
+        canvas.paste(tile, (x-105, y), mask)
+        face = font(37, True)
+        for j, line in enumerate(lines_for(player.name, face, 277, 2)):
+            draw.text((x, 695+j*48), line, font=face, anchor="mm", fill="#fff5dc",
+                      stroke_width=2, stroke_fill="#163d40")
+    output = BytesIO()
+    canvas.save(output, "JPEG", quality=91, optimize=True)
+    return output.getvalue()
+
+
 def render_matchup(background, name, localized, number, teams):
     with Image.open(background) as source:
         canvas = ImageOps.fit(source.convert("RGB"), (1600, 900), method=Image.Resampling.LANCZOS)

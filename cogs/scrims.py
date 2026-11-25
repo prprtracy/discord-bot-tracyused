@@ -13,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import Database, Scrim
-from scrim_card import CardPlayer, render_matchup
+from scrim_card import CardPlayer, render_matchup, render_victory
 
 
 PLAYER_COUNT = 10
@@ -224,7 +224,12 @@ class HostPanel(discord.ui.View):
         self.cog = cog
         self.scrim = scrim
         a_size = team_a_size(scrim)
-        if mode == "remove":
+        if mode == "winner":
+            if scrim.team_a:
+                self.add_map_button("A 队获胜", "win_a", discord.ButtonStyle.success)
+            if set(scrim.players).difference(scrim.team_a):
+                self.add_map_button("B 队获胜", "win_b", discord.ButtonStyle.success)
+        elif mode == "remove":
             self.add_picker("删除用户", "remove", 1)
         elif mode == "pick":
             self.add_picker(f"选择 A 队的 {a_size} 名成员", "pick", a_size)
@@ -638,14 +643,7 @@ class Scrims(commands.Cog):
             await room.delete(reason=f"第 {scrim.number} 场内战结束")
         return ""
 
-    async def publish_map_announcement(
-        self, scrim: Scrim, map_name: str, results: dict[int, str],
-    ) -> int:
-        image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
-        map_card = discord.Embed(
-            title=f"第 {scrim.number} 次趣味瓦内战 · 开始比赛",
-            description=f"**{map_label(map_name)}**",
-        )
+    async def load_card_players(self, scrim: Scrim, roster: dict[int, str], results: dict[int, str]):
         guild = self.bot.get_guild(scrim.guild_id)
         async def load_player(user_id, saved_name):
             member = guild.get_member(user_id) if guild else None
@@ -658,9 +656,26 @@ class Scrims(commands.Cog):
                     avatar = await asyncio.wait_for(asset.read(), timeout=5)
             except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError):
                 avatar = None
-            return CardPlayer(member.display_name if member else saved_name, results[user_id], avatar)
+            return CardPlayer(member.display_name if member else saved_name, results.get(user_id, ""), avatar)
 
-        players = await asyncio.gather(*(load_player(uid, name) for uid, name in scrim.players.items()))
+        return await asyncio.gather(*(load_player(uid, name) for uid, name in roster.items()))
+
+    async def publish_victory(self, scrim: Scrim, team: str, roster: dict[int, str]):
+        players = await self.load_card_players(scrim, roster, {})
+        data = await asyncio.to_thread(render_victory, team, players)
+        channel = self.bot.get_partial_messageable(scrim.channel_id)
+        with closing(discord.File(BytesIO(data), filename=f"victory-{scrim.number}.jpg")) as image:
+            await channel.send(f"第 {scrim.number} 次趣味瓦内战 · **{team} 队获胜**", file=image, allowed_mentions=NO_PINGS)
+
+    async def publish_map_announcement(
+        self, scrim: Scrim, map_name: str, results: dict[int, str],
+    ) -> int:
+        image_path = MAP_IMAGE_DIR / f"{map_name.lower()}.jpg"
+        map_card = discord.Embed(
+            title=f"第 {scrim.number} 次趣味瓦内战 · 开始比赛",
+            description=f"**{map_label(map_name)}**",
+        )
+        players = await self.load_card_players(scrim, scrim.players, results)
         card_teams = {"A": [], "B": []}
         team_rows: dict[str, list[str]] = {"A": [], "B": []}
         for user_id, player in zip(scrim.players, players):
@@ -768,12 +783,20 @@ class Scrims(commands.Cog):
             if scrim.ended:
                 await interaction.edit_original_response(content="本场对战已结束。", view=None)
                 return
-            if scrim.map_announcement_id is not None and action not in ("picker", "replace_map", "end"):
+            if scrim.map_announcement_id is not None and action not in ("picker", "replace_map", "end", "win_a", "win_b"):
                 await interaction.edit_original_response(**self.panel(scrim, note="本场对战已经发布。\n"))
                 return
-            if action == "end":
+            if action in ("end", "win_a", "win_b"):
                 if scrim.map_announcement_id is None:
                     await interaction.edit_original_response(content="本场对战尚未开始。")
+                    return
+                if action == "end":
+                    await interaction.edit_original_response(**self.panel(scrim, "winner", "请选择本场获胜队伍。\n"))
+                    return
+                team = "A" if action == "win_a" else "B"
+                roster = {uid: name for uid, name in scrim.players.items() if (uid in scrim.team_a) == (team == "A")}
+                if not roster:
+                    await interaction.edit_original_response(**self.panel(scrim, "winner", "这支队伍没有参赛者。\n"))
                     return
                 try:
                     issue = await self.return_voice_members(interaction.guild, scrim)
@@ -782,6 +805,12 @@ class Scrims(commands.Cog):
                     issue = "语音归队或清理失败。请检查「移动成员」「连接」「管理频道」权限及集合频道容量，再点「结束对战」。"
                 if issue:
                     await interaction.edit_original_response(**self.panel(scrim, note=issue + "\n"))
+                    return
+                try:
+                    await self.publish_victory(scrim, team, roster)
+                except (discord.HTTPException, OSError):
+                    log.exception("Could not post victory card for scrim %s", round_id)
+                    await interaction.edit_original_response(**self.panel(scrim, "winner", "语音已清理，胜利图发布失败，请选择胜方重试。\n"))
                     return
                 updated = replace(scrim, ended=True)
                 result = "对战已结束，本场队伍语音频道已清理。"
